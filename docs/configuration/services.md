@@ -207,15 +207,20 @@ Stores the physical travel times of a timed cover **by hand** — the manual alt
 ### Fields
 | Parameter | Type | Required | Description | Example |
 | :--- | :---: | :---: | :--- | :--- |
-| `entity_id` | target | Yes | One or more MyHOME timed cover entities. | `cover.bedroom_shutter` |
+| `entity_id` | target | Yes | One or more MyHOME cover entities. Position-reporting blinds accept slat settings only. | `cover.bedroom_shutter` |
 | `travel_time` | float | No* | Seconds for a full travel, both directions. | `24.5` |
 | `travel_time_down` | float | No* | Seconds for a full closing run. | `24.5` |
 | `travel_time_up` | float | No* | Seconds for a full opening run. | `26.0` |
 | `slat_time` | float | No* | Seconds a Venetian blind (`slat_tilt: true`) needs for a full slat rotation, 0.5-10 s. Stored on its own it does not touch the stored travel times, and it also works on covers that report their position. It survives restarts, also for covers declared in `myhome.yaml` (where it wins over the yaml `slat_time`); `reset_cover_travel_time` returns it to the yaml value or the 2 s default. | `2.0` |
+| `slat_time_up` / `slat_time_down` | float | No* | Seconds for a full opening / closing slat rotation, 0.5–10 s. Directions with no override inherit `slat_time`. | `1.4` |
+| `slat_offset` / `slat_offset_up` / `slat_offset_down` | float | No* | Signed full-rotation height offsets, −100 to +100 percentage points. Opening adds the up offset; closing subtracts the down offset. An explicit directional zero overrides the shared offset. | `1` |
+| `slat_granularity` | integer | No* | Requested tilt step, 1–100 percent, nearest step with upward ties and both endpoints always reachable. | `50` |
 | `copied_from` | entity id | No | The cover the times were taken from; `calibration_source` becomes `copied` and `copied_from` is exposed as an attribute. | `cover.living_room_west` |
 | `min_motor_pulse` | float | No | Minimum duration in seconds (0.0–5.0) of a motor pulse to overcome mechanical deadband and brake inertia. Defaults to 0.4 s (0.0 disables). | `0.4` |
 
-\* at least one of the time fields or min_motor_pulse is required.
+\* at least one travel time, slat setting or `min_motor_pulse` is required. Omitting a slat setting leaves its stored value unchanged; `reset_cover_travel_time` removes stored overrides and returns to YAML or the defaults.
+
+Nonzero slat offsets enable height compensation through the blind's normal tilt controls; see [Covers → Holding height while tilting](covers.md#holding-height-while-tilting).
 
 ### Example YAML Call
 ```yaml
@@ -232,12 +237,12 @@ data:
 
 ## 10. `myhome.reset_cover_travel_time`
 
-Forgets the measured or manually set travel times of a timed cover. The cover returns to the `travel_time` from `myhome.yaml` when one is configured, otherwise to the 25 s default, and `calibration_source` reports `yaml` / `default` again. A stored `slat_time` returns to the yaml value or the 2 s default as well. On a position-reporting Venetian blind (`advanced_shutter` and `slat_tilt`) the service only resets the `slat_time`; other position-reporting covers refuse it.
+Forgets the measured or manually set travel times of a timed cover. The cover returns to the `travel_time` from `myhome.yaml` when one is configured, otherwise to the 25 s default, and `calibration_source` reports `yaml` / `default` again. All stored slat times, directional overrides, offsets and granularity return to YAML or their defaults. On a position-reporting Venetian blind (`advanced_shutter` and `slat_tilt`) only slat settings are reset; other position-reporting covers refuse it.
 
 ### Fields
 | Parameter | Type | Required | Description | Example |
 | :--- | :---: | :---: | :--- | :--- |
-| `entity_id` | target | Yes | One or more MyHOME timed cover entities. | `cover.bedroom_shutter` |
+| `entity_id` | target | Yes | One or more MyHOME timed covers or position-reporting slat blinds. | `cover.bedroom_shutter` |
 
 ### Example YAML Call
 ```yaml

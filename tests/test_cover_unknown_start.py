@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.components.cover import ATTR_CURRENT_POSITION
-from homeassistant.core import State
+from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from OWNd.message import OWNEvent
 
@@ -531,13 +531,22 @@ async def test_reversal_during_a_settling_run_from_unknown_ends_at_the_next_stop
 # ------------------------------------------------------------------ members of a scope cover on the main bus
 
 
-def _make_area(hass, gateway, members):
-    """Area 1 on the main bus (no F422): one scope frame moves every member."""
+def _make_area(
+    hass: HomeAssistant,
+    gateway: MagicMock,
+    members: list[MyHOMECover],
+    *,
+    where: str = "1",
+    native: bool = False,
+) -> MyHOMEScopeCover:
+    """Make a main-bus scope linked to its members; timed unless native is selected."""
     family = CoverFamily()
+    scope = CoverScope.of(where, members=[member._where for member in members])
+    assert scope is not None
     area = MyHOMEScopeCover(
-        hass=hass, gateway=gateway, name="Area 1", entity_name=None, device_id="1", who="2", where="1",
-        interface=None, advanced=False, manufacturer="BTicino", model="Area", travel_time=6,
-        scope=CoverScope.of("1"),
+        hass=hass, gateway=gateway, name="Area 1", entity_name=None, device_id=where, who="2", where=where,
+        interface=None, advanced=native, strategy_name="native" if native else None,
+        manufacturer="BTicino", model="Area", travel_time=6, scope=scope,
     )
     area.hass = hass
     area.entity_id = "cover.area_1"
@@ -675,34 +684,53 @@ async def test_scope_frame_lost_after_queueing_aborts_the_members_runs(hass, gat
     assert area.is_opening is False
 
 
-async def test_scope_set_position_0_on_the_main_bus_settles_the_members_too(hass, gateway, clock, fake_time) -> None:
-    """`set_cover_position: 0` on the area is a full run of the scope: its members with no position settle like its own run."""
+@pytest.mark.parametrize(
+    "where,native,target",
+    [("1", False, 0), ("1", True, 0), ("1", True, 100), ("#1", True, 0), ("#1", True, 100)],
+)
+async def test_scope_set_position_end_on_the_main_bus_settles_the_members_too(
+    hass: HomeAssistant,
+    gateway: MagicMock,
+    clock: Clock,
+    fake_time: MagicMock,
+    where: str,
+    native: bool,
+    target: int,
+) -> None:
+    """A scope height endpoint keeps unknown members settling after an early actuator stop."""
     members = _make_members(hass, gateway)
-    area = _make_area(hass, gateway, members)
+    area = _make_area(hass, gateway, members, where=where, native=native)
+    opening = target == 100
+    frame = f"*2*{1 if opening else 2}*{where}##"
     release = asyncio.Event()
     with patch("custom_components.myhome.cover.asyncio.sleep", side_effect=_controlled_sleep(release)):
         try:
-            await area.async_set_cover_position(position=0)
+            await area.async_set_cover_position(position=target)
             raw, written = gateway.deliveries[-1]
-            assert raw == "*2*2*1##"
-            assert all(m.is_closing and m._end_run_from_unknown for m in members)
-            assert area._stop_task is not None  # the scope's own settle, as before
+            assert raw == frame
+            assert all((m.is_opening if opening else m.is_closing) and m._end_run_from_unknown for m in members)
+            if not native:
+                assert area._stop_task is not None  # the timed scope's own settle, as before
             written.set_result(clock.now)
             await _yield()
             clock.now += 0.12
             for cover in (area, *members):
-                cover.handle_event(OWNEvent.parse("*2*2*1##"))
+                cover.handle_event(OWNEvent.parse(frame))
             clock.now += 5.0
             for member in members:
                 member.handle_event(OWNEvent.parse(f"*2*0*{member._where}##"))
-            assert all(m.is_closing and m.current_cover_position is None for m in members)
+            assert all(
+                (m.is_opening if opening else m.is_closing) and m.current_cover_position is None
+                for m in members
+            )
             clock.now += 3.1
         finally:
             release.set()
-        await asyncio.wait_for(asyncio.gather(area._stop_task, *(m._stop_task for m in members)), 1.0)
-    assert [m.current_cover_position for m in members] == [0, 0]
-    assert area.current_cover_position == 0
-    assert area.is_closed is True
+        tasks = [cover._stop_task for cover in (area, *members) if cover._stop_task is not None]
+        await asyncio.wait_for(asyncio.gather(*tasks), 1.0)
+    assert [m.current_cover_position for m in members] == [target, target]
+    assert area.current_cover_position == target
+    assert area.is_closed is (target == 0)
 
 
 async def test_scope_stop_on_the_main_bus_leaves_the_settling_members_unknown(hass, gateway, clock, fake_time) -> None:

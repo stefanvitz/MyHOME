@@ -47,6 +47,8 @@ class CoverKinematicsStrategy(Protocol):
     travel_time_up: float
     min_motor_pulse: float
     slat_time: float
+    slat_time_up: float | None
+    slat_time_down: float | None
 
     @property
     def name(self) -> str:
@@ -72,7 +74,7 @@ class CoverKinematicsStrategy(Protocol):
     def min_pulse_for(self) -> float:
         """Return minimum motor pulse floor in seconds."""
 
-    def slat_time_for(self) -> float:
+    def slat_time_for(self, opening: bool | None = None) -> float:
         """Return full slat rotation time in seconds."""
 
     def quantize_target(self, current: int | None, target: int) -> int:
@@ -185,6 +187,8 @@ class BaseCoverStrategy:
         travel_time_down: float | None = None,
         min_motor_pulse: float = DEFAULT_MIN_MOTOR_PULSE,
         slat_time: float | None = None,
+        slat_time_up: float | None = None,
+        slat_time_down: float | None = None,
     ) -> None:
         """Initialize timing parameters owned by the strategy."""
         base = float(travel_time) if travel_time and travel_time > 0 else float(DEFAULT_TRAVEL_TIME)
@@ -196,6 +200,8 @@ class BaseCoverStrategy:
         )
         self.min_motor_pulse: float = max(0.0, float(min_motor_pulse))
         self.slat_time: float = clamp_slat_time(slat_time, DEFAULT_SLAT_TIME)
+        self.slat_time_up: float | None = clamp_slat_time(slat_time_up) if slat_time_up is not None else None
+        self.slat_time_down: float | None = clamp_slat_time(slat_time_down) if slat_time_down is not None else None
 
     def travel_for_direction(self, opening: bool) -> float:
         """Return full end-to-end travel seconds for the given direction."""
@@ -213,8 +219,12 @@ class BaseCoverStrategy:
         """Return minimum motor pulse floor in seconds (#704, #708)."""
         return self.min_motor_pulse
 
-    def slat_time_for(self) -> float:
-        """Return the effective slat full-rotation time in seconds."""
+    def slat_time_for(self, opening: bool | None = None) -> float:
+        """Return the effective slat full-rotation time for a direction."""
+        if opening is True and self.slat_time_up is not None:
+            return self.slat_time_up
+        if opening is False and self.slat_time_down is not None:
+            return self.slat_time_down
         return self.slat_time
 
     def quantize_target(self, current: int | None, target: int) -> int:  # pylint: disable=unused-argument
@@ -230,7 +240,7 @@ class BaseCoverStrategy:
         """Return clamped [0, 100] slat tilt angle after ``elapsed`` seconds in ``direction``."""
         opening = direction == "open"
         curr = int(start_tilt) if start_tilt is not None else (0 if opening else 100)
-        slat = self.slat_time_for()
+        slat = self.slat_time_for(opening)
         turned = (max(0.0, float(elapsed)) / slat) * 100.0 if slat > 0 else 100.0
         if opening:
             return min(100, int(round(curr + turned)))
@@ -259,7 +269,7 @@ class BaseCoverStrategy:
         diff = clamped_target - clamped_start
         if diff == 0:
             return 0.0
-        run_duration = (abs(diff) / 100.0) * self.slat_time_for()
+        run_duration = (abs(diff) / 100.0) * self.slat_time_for(diff > 0)
         if enforce_min_pulse and run_duration < self.min_pulse_for():
             return 0.0
         return run_duration
@@ -271,6 +281,8 @@ class BaseCoverStrategy:
         other.travel_time_up = self.travel_time_up
         other.min_motor_pulse = self.min_motor_pulse
         other.slat_time = self.slat_time
+        other.slat_time_up = self.slat_time_up
+        other.slat_time_down = self.slat_time_down
         return other
 
     def _kept(self) -> CoverKinematicsStrategy:

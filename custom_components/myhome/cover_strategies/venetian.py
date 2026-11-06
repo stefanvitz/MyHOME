@@ -38,6 +38,8 @@ class VenetianTiltStrategy(TimedCurtainStrategy):
         travel_time_up: float | None = None,
         travel_time_down: float | None = None,
         min_motor_pulse: float = DEFAULT_MIN_MOTOR_PULSE,
+        slat_time_up: float | None = None,
+        slat_time_down: float | None = None,
     ) -> None:
         """Initialize Venetian strategy with shared ``slat_time``."""
         super().__init__(
@@ -46,6 +48,8 @@ class VenetianTiltStrategy(TimedCurtainStrategy):
             travel_time_down=travel_time_down,
             min_motor_pulse=min_motor_pulse,
             slat_time=slat_time,
+            slat_time_up=slat_time_up,
+            slat_time_down=slat_time_down,
         )
 
     @property
@@ -67,7 +71,7 @@ class VenetianTiltStrategy(TimedCurtainStrategy):
     def curtain_travel_for(self, opening: bool) -> float:
         """Return vertical curtain travel seconds (end-to-end travel minus slat rotation phase)."""
         travel = self.travel_for_direction(opening)
-        slat = self.slat_time_for()
+        slat = self.slat_time_for(opening)
         if travel > slat:
             return travel - slat
         return travel
@@ -84,7 +88,7 @@ class VenetianTiltStrategy(TimedCurtainStrategy):
         if curr is None:
             curr = 0 if opening else 100
         remaining = (100 - curr) if opening else curr
-        return max(0.0, (remaining / 100.0) * self.slat_time_for())
+        return max(0.0, (remaining / 100.0) * self.slat_time_for(opening))
 
     def carry_overshoot_into_curtain(
         self,
@@ -95,7 +99,7 @@ class VenetianTiltStrategy(TimedCurtainStrategy):
     ) -> int:
         """Convert motor runtime past a full slat rotation into vertical curtain displacement."""
         opening = direction == "open"
-        slat = self.slat_time_for()
+        slat = self.slat_time_for(opening)
         to_end = ((100 - start_tilt) if opening else start_tilt) / 100.0 * slat
         excess = max(0.0, float(elapsed)) - to_end
         if excess <= 0:

@@ -29,6 +29,8 @@ def resolve_cover_strategy(
     strategy_name: str | None = None,
     slat_tilt: bool = False,
     slat_time: float | None = None,
+    slat_time_up: float | None = None,
+    slat_time_down: float | None = None,
     travel_time: float | None = DEFAULT_TRAVEL_TIME,
     travel_time_up: float | None = None,
     travel_time_down: float | None = None,
@@ -69,6 +71,8 @@ def resolve_cover_strategy(
                 travel_time_down=travel_time_down,
                 min_motor_pulse=min_motor_pulse,
                 slat_time=slat_time,
+                slat_time_up=slat_time_up,
+                slat_time_down=slat_time_down,
             )
         if normalized == "simple":
             return SimpleUpDownStopStrategy(
@@ -77,10 +81,14 @@ def resolve_cover_strategy(
                 travel_time_down=travel_time_down,
                 min_motor_pulse=min_motor_pulse,
                 slat_time=slat_time,
+                slat_time_up=slat_time_up,
+                slat_time_down=slat_time_down,
             )
         if normalized == "venetian":
             return VenetianTiltStrategy(
                 slat_time=slat_time,
+                slat_time_up=slat_time_up,
+                slat_time_down=slat_time_down,
                 travel_time=effective_travel,
                 travel_time_up=travel_time_up,
                 travel_time_down=travel_time_down,
@@ -93,6 +101,8 @@ def resolve_cover_strategy(
                 travel_time_down=travel_time_down,
                 min_motor_pulse=min_motor_pulse,
                 slat_time=slat_time,
+                slat_time_up=slat_time_up,
+                slat_time_down=slat_time_down,
             )
 
     if advanced:
@@ -103,10 +113,14 @@ def resolve_cover_strategy(
             travel_time_down=travel_time_down,
             min_motor_pulse=min_motor_pulse,
             slat_time=slat_time,
+            slat_time_up=slat_time_up,
+            slat_time_down=slat_time_down,
         )
     if slat_tilt:
         return VenetianTiltStrategy(
             slat_time=slat_time,
+            slat_time_up=slat_time_up,
+            slat_time_down=slat_time_down,
             travel_time=effective_travel,
             travel_time_up=travel_time_up,
             travel_time_down=travel_time_down,
@@ -119,6 +133,8 @@ def resolve_cover_strategy(
             travel_time_down=travel_time_down,
             min_motor_pulse=min_motor_pulse,
             slat_time=slat_time,
+            slat_time_up=slat_time_up,
+            slat_time_down=slat_time_down,
         )
     return TimedCurtainStrategy(
         travel_time=effective_travel,
@@ -126,4 +142,6 @@ def resolve_cover_strategy(
         travel_time_down=travel_time_down,
         min_motor_pulse=min_motor_pulse,
         slat_time=slat_time,
+        slat_time_up=slat_time_up,
+        slat_time_down=slat_time_down,
     )
