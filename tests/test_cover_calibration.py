@@ -1,24 +1,29 @@
 """Cover calibration: measure up/down travel on the bus, store it, apply it (myhome.calibrate_cover)."""
 import asyncio
+from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import voluptuous as vol
 from homeassistant.components.cover import ATTR_POSITION
-from homeassistant.core import callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from OWNd.message import OWNEvent
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.myhome.const import CONF_COVER_TRAVEL_TIMES, EVENT_COVER_CALIBRATION
+from custom_components.myhome.const import CONF_COVER_TRAVEL_TIMES, DOMAIN, EVENT_COVER_CALIBRATION
 from custom_components.myhome.cover import (
     CalibrationCutoff,
     CalibrationInterrupted,
     CoverCalibrationHub,
     MyHOMECover,
     _actuator_cutoff,
+    _service_slat_setting,
     _stored_calibration,
     async_stop_cover_calibration,
     get_last_calibration_trace,
 )
+from custom_components.myhome.cover_slat import plan_tilt_compensation
 from tests.conftest import attach_runtime, bind_entity
 
 
@@ -729,12 +734,13 @@ async def test_cover_async_stop_calibration_method(hass, gateway):
 
 
 async def test_reset_travel_time_advanced_and_yaml(hass, gateway):
-    """Reset travel time refuses advanced covers and honors YAML config."""
+    """Native reset restores its minimum; a timed reset still honors YAML travel time."""
     from custom_components.myhome.const import CONF_PLATFORMS, CONF_TRAVEL_TIME, DOMAIN
 
     adv_cover = _make_cover(hass, gateway, advanced=True)
-    with pytest.raises(HomeAssistantError, match="reports its position"):
-        await adv_cover.async_reset_travel_time()
+    await adv_cover.async_set_travel_time(min_position_delta=1)
+    await adv_cover.async_reset_travel_time()
+    assert adv_cover.extra_state_attributes["min_position_delta"] == 2
 
     # With YAML configuration on the entry's runtime data (seeded through the legacy mapping)
     cover = _make_cover(hass, gateway)
@@ -1193,10 +1199,9 @@ async def test_set_travel_time_validation_raises_translated_service_errors(hass,
 
     advanced = MyHOMECover(hass=hass, name="Pos", entity_name=None, device_id="31", who="2", where="31",
                            interface=None, advanced=True, manufacturer="BTicino", model="F401", gateway=gateway)
-    for coro in (advanced.async_set_travel_time(travel_time=10), advanced.async_reset_travel_time()):
-        with pytest.raises(HomeAssistantError) as err:
-            await coro
-        assert err.value.translation_key == "cover_reports_position"
+    with pytest.raises(HomeAssistantError) as err:
+        await advanced.async_set_travel_time(travel_time=10)
+    assert err.value.translation_key == "cover_reports_position"
 
 
 def test_every_raised_translation_key_is_defined():
@@ -1888,5 +1893,230 @@ def test_stored_calibration_restores_min_motor_pulse(hass, gateway):
     assert cover3._min_motor_pulse == 0.0
     assert cover3.extra_state_attributes["min_motor_pulse"] == 0.0
 
+
+async def test_shared_slat_time_rounding_survives_reload(
+    hass: HomeAssistant, gateway: MagicMock,
+) -> None:
+    """Persist the effective timing so a reload preserves pulses near the motor floor."""
+    entry = MockConfigEntry(domain=DOMAIN, data={"mac": gateway.mac}, options={})
+    entry.add_to_hass(hass)
+    gateway.config_entry = entry
+    settings = dict(advanced=True, slat_tilt=True, slat_offset=0.5, min_position_delta=1)
+    cover = _make_cover(hass, gateway, **settings)
+    result = await cover.async_set_travel_time(slat_time=0.505)
+    stored = _stored_calibration(entry, "21")
+    assert result["slat_time"] == 0.51
+    assert stored == {"slat_time": 0.51}
+    restored = _make_cover(hass, gateway, calibration=stored, **settings)
+    for entity in (cover, restored):
+        assert entity._slat_time_for(True) == entity._slat_time_for(False) == 0.51
+        assert entity._min_motor_pulse == 0.4
+        assert entity._strategy.tilt_pulse_duration_for(0, 79) == pytest.approx(0.4029)
+        plan = plan_tilt_compensation(
+            50, 0, 79,
+            offset_up=entity._slat_offset_for(True),
+            offset_down=entity._slat_offset_for(False),
+            time_up=entity._slat_time_for(True),
+            time_down=entity._slat_time_for(False),
+            min_delta=1, min_pulse=entity._min_motor_pulse,
+        )
+        assert plan.pre_position == 50 and not plan.move
+    gateway.send.assert_not_awaited()
+
+
+async def test_oversized_slat_offset_has_no_side_effects(
+    hass: HomeAssistant, gateway: MagicMock,
+) -> None:
+    """Oversized integers fail validation before a combined update changes anything."""
+    from custom_components.myhome.validate import cover_schema
+
+    cover = _make_cover(hass, gateway, advanced=True, slat_tilt=True)
+    cover._persist_calibration = MagicMock()
+    cancel = cover._compensation_cancel = asyncio.Event()
+    sequence = cover._tilt_request_seq
+    attrs = deepcopy(cover.extra_state_attributes)
+    bad = 10**400
+    with pytest.raises(vol.Invalid, match="slat_offset must be between"):
+        cover_schema({
+            "blind": {"where": "21", "name": "Blind", "slat_tilt": True, "slat_offset": bad},
+        })
+    with pytest.raises(vol.Invalid, match="slat_offset must be between"):
+        _service_slat_setting("slat_offset", bad)
+    with pytest.raises(ServiceValidationError, match="slat_offset") as err:
+        await cover.async_set_travel_time(slat_time=4, slat_offset=bad)
+    assert err.value.translation_key == "calibration_interrupted"
+    assert err.value.translation_placeholders == {
+        "name": cover._display_name,
+        "cause": "slat_offset must be between -100.0 and 100.0",
+    }
+    assert cover.extra_state_attributes == attrs
+    assert cover._slat_time == 2
+    assert cover._tilt_request_seq == sequence
+    assert not cancel.is_set()
+    cover._persist_calibration.assert_not_called()
+    gateway.send.assert_not_awaited()
+
+
+_INVALID_MIN_POSITION_DELTAS: tuple[object, ...] = (
+    0, 6, 1.5, True, "bad", float("nan"), float("inf"), 10**400,
+)
+
+
+@pytest.mark.parametrize("slat_tilt", [False, True])
+async def test_native_min_position_delta_persists_only_explicit_updates(
+    hass: HomeAssistant, gateway: MagicMock, slat_tilt: bool,
+) -> None:
+    """Native minimum updates persist without manufacturing travel calibration."""
+    entry = MockConfigEntry(domain=DOMAIN, data={"mac": gateway.mac}, options={})
+    entry.add_to_hass(hass)
+    gateway.config_entry = entry
+    cover = _make_cover(hass, gateway, advanced=True, slat_tilt=slat_tilt)
+    cover._attr_current_cover_position = 90
+    before = (cover._travel_time_down, cover._travel_time_up, cover._calibration_source, cover._calibrated_at)
+    if slat_tilt:
+        await cover.async_set_travel_time(slat_time=0.5)
+        assert _stored_calibration(entry, "21") == {"slat_time": 0.5}
+        await cover.async_set_travel_time(min_position_delta=1, slat_time=0.5)
+        await cover.async_set_travel_time(slat_time=2)
+        expected = {"min_position_delta": 1, "slat_time": 2.0}
+    else:
+        await cover.async_set_travel_time(min_position_delta=1)
+        expected = {"min_position_delta": 1}
+    stored = _stored_calibration(entry, "21")
+    assert stored == expected
+    assert cover.extra_state_attributes["min_position_delta"] == 1
+    assert cover.current_cover_position == 90
+    assert (cover._travel_time_down, cover._travel_time_up, cover._calibration_source, cover._calibrated_at) == before
+    restored = _make_cover(
+        hass, gateway, advanced=True, slat_tilt=slat_tilt, min_position_delta=5, calibration=stored,
+    )
+    assert restored.extra_state_attributes["min_position_delta"] == 1
+    gateway.send.assert_not_awaited()
+
+
+@pytest.mark.parametrize("slat_tilt", [False, True])
+async def test_native_min_position_delta_yaml_reload_and_service_schema(
+    hass: HomeAssistant, gateway: MagicMock, slat_tilt: bool,
+) -> None:
+    """The real YAML setup restores the minimum and registers the same validation."""
+    from homeassistant.helpers.entity_platform import current_platform
+
+    from custom_components.myhome.cover import async_setup_entry
+    from custom_components.myhome.validate import cover_schema
+
+    config = {
+        "where": "21", "name": "Native cover", "advanced_shutter": True,
+        "slat_tilt": slat_tilt, "min_position_delta": 5,
+    }
+    gateway.config_entry.options = {CONF_COVER_TRAVEL_TIMES: {"21": {"min_position_delta": 1}}}
+    gateway.config_entry.data = {"mac": gateway.mac}
+    gateway.config_entry.entry_id = "native_minimum_reload"
+    hass.data[DOMAIN] = {gateway.mac: {"entity": gateway, "platforms": {"cover": {"21": config}}}}
+    attach_runtime(hass, gateway.config_entry)
+    added: list[MyHOMECover] = []
+    platform = MagicMock()
+    token = current_platform.set(platform)
+    try:
+        with (
+            patch("homeassistant.helpers.entity_registry.async_entries_for_config_entry", return_value=[]),
+            patch("homeassistant.helpers.entity_registry.async_get", return_value=MagicMock()),
+        ):
+            await async_setup_entry(hass, gateway.config_entry, added.extend)
+    finally:
+        current_platform.reset(token)
+    assert len(added) == 1
+    assert added[0].extra_state_attributes["min_position_delta"] == 1
+    assert added[0]._slat_tilt is slat_tilt
+    service_schema = vol.Schema(next(
+        call.args[1] for call in platform.async_register_entity_service.call_args_list
+        if call.args[0] == "set_cover_travel_time"
+    ))
+    for valid in (1, 5, 1.0, "1"):
+        assert service_schema({"min_position_delta": valid})["min_position_delta"] == int(valid)
+    for bad in _INVALID_MIN_POSITION_DELTAS:
+        with pytest.raises(vol.Invalid):
+            service_schema({"min_position_delta": bad})
+        with pytest.raises(vol.Invalid):
+            cover_schema({"native": {**config, "min_position_delta": bad}})
+
+
+@pytest.mark.parametrize("slat_tilt", [False, True])
+@pytest.mark.parametrize("yaml_minimum", [None, 3])
+async def test_native_min_position_delta_reset_preserves_height_and_travel(
+    hass: HomeAssistant, gateway: MagicMock, slat_tilt: bool, yaml_minimum: int | None,
+) -> None:
+    """Reset removes native overrides and restores YAML or the default minimum."""
+    other = {"22": {"min_position_delta": 4}}
+    entry = MockConfigEntry(domain=DOMAIN, data={"mac": gateway.mac}, options={CONF_COVER_TRAVEL_TIMES: other})
+    entry.add_to_hass(hass)
+    gateway.config_entry = entry
+    cover = _make_cover(hass, gateway, advanced=True, slat_tilt=slat_tilt)
+    cover._attr_current_cover_position = 90
+    await cover.async_set_travel_time(min_position_delta=1)
+    before = (cover._travel_time_down, cover._travel_time_up, cover._calibration_source, cover._calibrated_at)
+    config = {"travel_time": 32}
+    if yaml_minimum is not None:
+        config["min_position_delta"] = yaml_minimum
+    with patch.object(cover, "_device_config", return_value=config):
+        await cover.async_reset_travel_time()
+    expected = 2 if yaml_minimum is None else yaml_minimum
+    assert cover.extra_state_attributes["min_position_delta"] == expected
+    assert cover.current_cover_position == 90
+    assert (cover._travel_time_down, cover._travel_time_up, cover._calibration_source, cover._calibrated_at) == before
+    assert entry.options[CONF_COVER_TRAVEL_TIMES] == other
+    gateway.send.assert_not_awaited()
+
+
+@pytest.mark.parametrize("bad", _INVALID_MIN_POSITION_DELTAS)
+async def test_native_min_position_delta_invalid_update_has_no_side_effects(
+    hass: HomeAssistant, gateway: MagicMock, bad: object,
+) -> None:
+    """Invalid minimum values reject a whole combined update before cancellation."""
+    cover = _make_cover(hass, gateway, advanced=True, slat_tilt=True)
+    cover._persist_calibration = MagicMock()
+    cancel = cover._compensation_cancel = asyncio.Event()
+    sequence = cover._tilt_request_seq
+    attrs = deepcopy(cover.extra_state_attributes)
+    with pytest.raises(ServiceValidationError, match="min_position_delta"):
+        await cover.async_set_travel_time(min_position_delta=bad, slat_time=4)  # type: ignore[arg-type]
+    assert cover.extra_state_attributes == attrs
+    assert cover._slat_time == 2
+    assert cover._strategy.min_position_delta == 2
+    assert cover._tilt_request_seq == sequence
+    assert not cancel.is_set()
+    cover._persist_calibration.assert_not_called()
+    gateway.send.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "advanced,slat_tilt,updates",
+    [
+        (False, False, {"min_position_delta": 1, "travel_time": 20, "min_motor_pulse": 0.2}),
+        (False, True, {"min_position_delta": 1, "slat_time": 0.5}),
+        (True, False, {"min_position_delta": 1, "travel_time": 20}),
+        (True, True, {"min_position_delta": 1, "min_motor_pulse": 0.2, "slat_time": 0.5}),
+        (True, False, {"min_position_delta": 1, "slat_time": 0.5}),
+    ],
+)
+async def test_native_min_position_delta_incompatible_update_has_no_side_effects(
+    hass: HomeAssistant, gateway: MagicMock, advanced: bool, slat_tilt: bool, updates: dict[str, object],
+) -> None:
+    """Native-only minimum updates do not relax existing capability guards."""
+    cover = _make_cover(hass, gateway, advanced=advanced, slat_tilt=slat_tilt)
+    cover._persist_calibration = MagicMock()
+    strategy = cover._strategy
+    cancel = cover._compensation_cancel = asyncio.Event()
+    sequence = cover._tilt_request_seq
+    attrs = deepcopy(cover.extra_state_attributes)
+    before = (cover._travel_time_down, cover._travel_time_up, cover._min_motor_pulse, cover._slat_time)
+    with pytest.raises(HomeAssistantError):
+        await cover.async_set_travel_time(**updates)  # type: ignore[arg-type]
+    assert cover._strategy is strategy
+    assert cover.extra_state_attributes == attrs
+    assert (cover._travel_time_down, cover._travel_time_up, cover._min_motor_pulse, cover._slat_time) == before
+    assert cover._tilt_request_seq == sequence
+    assert not cancel.is_set()
+    cover._persist_calibration.assert_not_called()
+    gateway.send.assert_not_awaited()
 
 

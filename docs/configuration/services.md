@@ -16,8 +16,8 @@ This document provides a comprehensive reference for all custom services registe
 | [`myhome.sweep_bus`](#6-myhomesweep_bus) | Gateway | Actively poll status across all subsystems to populate diagnostic buffers. |
 | [`myhome.calibrate_cover`](#7-myhomecalibrate_cover) | `cover` | Measure a timed cover's up and down travel times on the bus and store them. |
 | [`myhome.stop_cover_calibration`](#8-myhomestop_cover_calibration) | Gateway | Stop the running calibration and cancel queued ones. |
-| [`myhome.set_cover_travel_time`](#9-myhomeset_cover_travel_time) | `cover` | Store stopwatch-measured travel times without driving the cover. |
-| [`myhome.reset_cover_travel_time`](#10-myhomereset_cover_travel_time) | `cover` | Forget measured / manual travel times; back to YAML or the default. |
+| [`myhome.set_cover_travel_time`](#9-myhomeset_cover_travel_time) | `cover` | Store travel times, slat settings or a native minimum without driving the cover. |
+| [`myhome.reset_cover_travel_time`](#10-myhomereset_cover_travel_time) | `cover` | Forget calibration settings; back to YAML or the defaults. |
 | [`myhome.tuner_seek_up`](#11-myhometuner_seek_up) | `media_player` | Seek forward to the next receivable FM radio frequency on an F500 tuner. |
 | [`myhome.tuner_seek_down`](#12-myhometuner_seek_down) | `media_player` | Seek backward to the previous receivable FM radio frequency on an F500 tuner. |
 | [`myhome.send_scenario_plus_command`](#13-myhomesend_scenario_plus_command) | Gateway | Send a WHO 25 scenario plus command (on, off, increase, decrease, stop). |
@@ -207,15 +207,21 @@ Stores the physical travel times of a timed cover **by hand** — the manual alt
 ### Fields
 | Parameter | Type | Required | Description | Example |
 | :--- | :---: | :---: | :--- | :--- |
-| `entity_id` | target | Yes | One or more MyHOME timed cover entities. | `cover.bedroom_shutter` |
+| `entity_id` | target | Yes | One or more MyHOME timed or position-reporting covers. Position-reporting covers accept slat settings and `min_position_delta`, not travel times or `min_motor_pulse`. | `cover.bedroom_shutter` |
 | `travel_time` | float | No* | Seconds for a full travel, both directions. | `24.5` |
 | `travel_time_down` | float | No* | Seconds for a full closing run. | `24.5` |
 | `travel_time_up` | float | No* | Seconds for a full opening run. | `26.0` |
 | `slat_time` | float | No* | Seconds a Venetian blind (`slat_tilt: true`) needs for a full slat rotation, 0.5-10 s. Stored on its own it does not touch the stored travel times, and it also works on covers that report their position. It survives restarts, also for covers declared in `myhome.yaml` (where it wins over the yaml `slat_time`); `reset_cover_travel_time` returns it to the yaml value or the 2 s default. | `2.0` |
+| `slat_time_up` / `slat_time_down` | float | No* | Seconds for a full opening / closing slat rotation, 0.5–10 s. Directions with no override inherit `slat_time`. | `1.4` |
+| `slat_offset` / `slat_offset_up` / `slat_offset_down` | float | No* | Signed full-rotation height offsets, −100 to +100 percentage points. Opening adds the up offset; closing subtracts the down offset. An explicit directional zero overrides the shared offset. | `1` |
+| `slat_granularity` | integer | No* | Requested tilt step, 1–100 percentage points (default 1). Rounds targets from every caller to the nearest step, ties upward. Both endpoints stay reachable; 100 allows only targets 0 and 100. Current estimates are unchanged. | `10` |
 | `copied_from` | entity id | No | The cover the times were taken from; `calibration_source` becomes `copied` and `copied_from` is exposed as an attribute. | `cover.living_room_west` |
 | `min_motor_pulse` | float | No | Minimum duration in seconds (0.0–5.0) of a motor pulse to overcome mechanical deadband and brake inertia. Defaults to 0.4 s (0.0 disables). | `0.4` |
+| `min_position_delta` | integer | No* | Minimum native height change, 1–5 whole percentage points (default 2). Stored values override YAML after a restart. Use 1 only if the motor reliably executes one-point moves. | `2` |
 
-\* at least one of the time fields or min_motor_pulse is required.
+\* at least one travel time, slat setting, `min_motor_pulse` or `min_position_delta` is required. Omitting a slat or minimum setting leaves its stored value unchanged; `reset_cover_travel_time` removes stored overrides and returns to YAML or the defaults.
+
+Nonzero slat offsets enable height compensation through the blind's normal tilt controls; see [Covers → Holding height while tilting](covers.md#holding-height-while-tilting).
 
 ### Example YAML Call
 ```yaml
@@ -232,12 +238,12 @@ data:
 
 ## 10. `myhome.reset_cover_travel_time`
 
-Forgets the measured or manually set travel times of a timed cover. The cover returns to the `travel_time` from `myhome.yaml` when one is configured, otherwise to the 25 s default, and `calibration_source` reports `yaml` / `default` again. A stored `slat_time` returns to the yaml value or the 2 s default as well. On a position-reporting Venetian blind (`advanced_shutter` and `slat_tilt`) the service only resets the `slat_time`; other position-reporting covers refuse it.
+Forgets the measured or manually set travel times of a timed cover. The cover returns to the `travel_time` from `myhome.yaml` when one is configured, otherwise to the 25 s default, and `calibration_source` reports `yaml` / `default` again. All stored slat times, directional overrides, offsets and granularity return to YAML or their defaults. Position-reporting covers reset their slat settings and `min_position_delta` (YAML or default 2), leaving their travel times and reported height unchanged.
 
 ### Fields
 | Parameter | Type | Required | Description | Example |
 | :--- | :---: | :---: | :--- | :--- |
-| `entity_id` | target | Yes | One or more MyHOME timed cover entities. | `cover.bedroom_shutter` |
+| `entity_id` | target | Yes | One or more MyHOME timed or position-reporting covers. | `cover.bedroom_shutter` |
 
 ### Example YAML Call
 ```yaml

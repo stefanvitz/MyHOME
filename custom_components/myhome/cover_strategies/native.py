@@ -22,6 +22,8 @@ class NativePositionStrategy(BaseCoverStrategy):
         travel_time_down: float | None = None,
         min_motor_pulse: float = DEFAULT_MIN_MOTOR_PULSE,
         slat_time: float | None = None,
+        slat_time_up: float | None = None,
+        slat_time_down: float | None = None,
     ) -> None:
         """Initialize native position strategy with deadband quantum (#466)."""
         super().__init__(
@@ -30,6 +32,8 @@ class NativePositionStrategy(BaseCoverStrategy):
             travel_time_down=travel_time_down,
             min_motor_pulse=min_motor_pulse,
             slat_time=slat_time,
+            slat_time_up=slat_time_up,
+            slat_time_down=slat_time_down,
         )
         self.min_position_delta: int = max(1, int(min_position_delta))
 

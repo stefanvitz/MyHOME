@@ -234,6 +234,8 @@ class MyHOMEScopeCover(MyHOMECover):
         unknown member keeps settling to the end stop.
         """
         direction = "open" if opening else "close"
+        for member in self._members():
+            member._cancel_compensation_request()
         if self._is_tilting:
             self._apply_tilt_stop()
         followers = [m for m in self._members() if m._settles_full_run(opening)]
@@ -270,6 +272,7 @@ class MyHOMEScopeCover(MyHOMECover):
         tilting_leaders: list[tuple[MyHOMECover, int]] = []
         seen_leaders: set[int] = set()
         for member in self._members():
+            member._cancel_compensation_request()
             if member._is_tilting:
                 if member._tilt_follows is not self:
                     leader = member._tilt_follows if member._tilt_follows is not None else member
@@ -357,6 +360,8 @@ class MyHOMEScopeCover(MyHOMECover):
             # On the local bus one scope frame turns every member's slats: they
             # follow this pulse instead of reading its frames as a curtain run.
             self._pulse_followers = [m for m in self._members() if m._slat_tilt]
+            for member in self._pulse_followers:
+                member._cancel_compensation_request()
             for member in self._pulse_followers:
                 member._follow_pulse(self, direction)
         written = await super()._async_move(direction, is_tilting=is_tilting)

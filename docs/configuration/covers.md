@@ -83,7 +83,7 @@ For standard covers without hardware position feedback, the integration provides
 
 **Advanced covers** track their own level (`Dimension = 10` at motor start and motor stop; no intermediate frames are emitted while the motor runs), and the actuator turns a `Dimension = 11` level write (`*#2*<WHERE>*#11#001*<LEVEL>##`) into a timed run proportional to its learned travel time. On a short-travel shutter (~20 s, ~0.2 s per percent) a 1 % change is too brief to move the curtain ([#466](https://github.com/OpenWebNet-HA/MyHOME/issues/466)), so by default the integration widens any change smaller than 2 % to 2 % (50 % → 51 % is sent as 52 %), except while the cover is moving (it then reports the level it started from, so the request goes out as asked). Target levels `0 %` and `100 %` — including a move near an end whose widened target clamps to `0 %` or `100 %` (e.g. `98 %` → `99 %` widened to `100 %` at `min_position_delta: 2`) — are sent as plain close / open full runs so the motor stops on its limit switch.
 
-The smallest change is set per cover with `min_position_delta` in `/config/myhome.yaml` (whole percent, `1`–`5`, default `2`; a timed cover with it is rejected, it uses `min_motor_pulse` instead). On a long-travel shutter each percent is a longer run: on a 3.75 m F401 shutter behind an F454 (`91.3 s` up / `87.8 s` down, ~0.9 s per percent; [discussion #770](https://github.com/orgs/OpenWebNet-HA/discussions/770#discussioncomment-19144038)), captured `*#2*21*#11#001*<LEVEL>##` 2 % steps ran 1.7–1.8 s each — already past the ~1.4 s mechanical slat pivot (`3` short `H4660M2` keypad pulses all reported `2 %`) — so `min_position_delta: 1` (~0.9 s per 1 % step) is needed to reach intermediate slat angles before the curtain lifts. `1` sends every change as asked; a very fast motor may need `3`–`5`. The active value is shown as the `min_position_delta` attribute.
+The smallest change is set per cover with `min_position_delta` in `/config/myhome.yaml` or `myhome.set_cover_travel_time` (whole percent, `1`–`5`, default `2`; a timed cover with it is rejected, it uses `min_motor_pulse` instead). On a long-travel shutter each percent is a longer run: on a 3.75 m F401 shutter behind an F454 (`91.3 s` up / `87.8 s` down, ~0.9 s per percent; [discussion #770](https://github.com/orgs/OpenWebNet-HA/discussions/770#discussioncomment-19144038)), captured `*#2*21*#11#001*<LEVEL>##` 2 % steps ran 1.7–1.8 s each — already past the ~1.4 s mechanical slat pivot (`3` short `H4660M2` keypad pulses all reported `2 %`) — so `min_position_delta: 1` (~0.9 s per 1 % step) is needed to reach intermediate slat angles before the curtain lifts. `1` sends every change as asked; a very fast motor may need `3`–`5`. The active value is shown as the `min_position_delta` attribute.
 
 ```yaml
 # /config/myhome.yaml
@@ -93,6 +93,10 @@ cover:
     advanced_shutter: true
     min_position_delta: 1
 ```
+
+An action-set minimum overrides YAML after a restart, including on advanced covers without
+slat tilt. Omitting it leaves the stored value unchanged; `myhome.reset_cover_travel_time`
+restores the YAML minimum or the default 2 without changing a native cover's travel times.
 
 ---
 
@@ -207,6 +211,77 @@ cover:
 | :--- | :--- | :--- | :--- |
 | `slat_tilt` | boolean | `false` | Enables Venetian blind slat tilt controls and sets device class to `blind` unless `class` is set. |
 | `slat_time` | float | `2.0` | Full slat rotation travel time in seconds (allowed range: `0.5`–`10.0` s). A value set with `myhome.set_cover_travel_time` is stored and wins over this one after a restart, until `myhome.reset_cover_travel_time`. |
+| `slat_time_up` / `slat_time_down` | float | inherit `slat_time` | Full opening / closing rotation time, each 0.5–10 s. Used for tilt pulses and slat rotation during height runs, including timed covers and groups. |
+| `slat_offset` | float | `0` | Expected height change per full slat rotation, in signed percentage points, −100 to +100. |
+| `slat_offset_up` / `slat_offset_down` | float | inherit `slat_offset` | Opening adds `slat_offset_up`; closing subtracts `slat_offset_down`. Explicit `0` overrides the shared value. |
+| `slat_granularity` | integer | `1` | Requested tilt step, 1–100 percentage points. `1` keeps whole-percentage targets unchanged; `100` allows only targets 0 and 100. |
+
+All slat settings require `slat_tilt: true` (or `strategy: venetian`). Directions with no
+override inherit the shared value. Values set by `myhome.set_cover_travel_time` survive
+restarts and height calibration; omitting a field in a later call leaves its stored value
+unchanged. `myhome.reset_cover_travel_time` returns every slat setting to YAML or its default.
+
+The integration rounds every requested tilt target to the nearest step, including requests
+from sliders, actions and automations. With step 10, 94 rounds to 90 and 95 to 100;
+ties round upward. Both 0 and 100 remain reachable even if the step does not divide 100.
+Current tilt estimates are not rounded to the configured steps. The native Home Assistant
+slider still offers intermediate values; the rounding happens after the request.
+
+### Holding height while tilting
+
+On an **individual position-reporting blind** (`advanced_shutter: true` and `slat_tilt: true`),
+the normal `cover.set_cover_tilt_position`, `cover.open_cover_tilt` and `cover.close_cover_tilt`
+actions compensate for slat rotation when a nonzero effective slat offset is configured for
+the requested direction. They aim to keep the height reported before the tilt request.
+This needs a known Dimension 10 height; pre-positioning also needs an idle motor. With no
+offset in that direction, tilt behavior is unchanged. Timed covers and general / area /
+group covers do not compensate height; height-only actions are unchanged.
+
+```yaml
+action: cover.set_cover_tilt_position
+target:
+  entity_id: cover.living_room_blind
+data:
+  tilt_position: 100
+```
+
+The integration chooses tilt alone or an intermediate height reached by one upward or
+downward run. It prefers the smallest expected final height error, then the shortest run.
+Intermediate heights are bounded to 0–100 and rounded to whole percentages. Once the blind
+reports that it has stopped there, the remaining tilt pulse is computed from the current
+slat estimate. There is no second height run or correction loop. Pulses below `min_motor_pulse`
+are refused, not widened: `slat_time: 0.5` cannot execute a half rotation of 0.25 s with the
+default 0.4 s floor.
+
+With `slat_offset: 1`, a full opening raises height by one point. From height 50 with closed
+slats, fully opening them first moves to 49, then opens them to return to about 50. From
+height 50 with open slats, fully closing them first moves to 51.
+This one-point move is refused if `min_position_delta` is greater than 1. An infeasible request
+is refused and any expected height error is reported.
+The integration never silently lowers the motor floor or widens the height run.
+
+Only if the motor reliably executes one-point height moves, explicitly set the minimum:
+
+```yaml
+action: myhome.set_cover_travel_time
+target:
+  entity_id: cover.living_room_blind
+data:
+  min_position_delta: 1
+```
+
+A feasible tilt target during a pulse updates the running tilt without another height run.
+Other motion requests, STOPs and observed external movement cancel pending preparation.
+A stop at a different height, missing bus confirmation, or timeout aborts the request.
+Same-direction external commands without a distinct translation/target report cannot always
+be distinguished from the actuator's own status; do not operate a wall switch during a run.
+Bus-reported heights are displayed unchanged, including during the slat pulse.
+
+The `slat_compensation` attribute reports the original height, rounded tilt target,
+intermediate height, expected error and boundary limitation, applied directional settings,
+completion / interruption, final height / tilt and remaining height error. A final status
+report must confirm height; successful command delivery alone is not completion. Test settings
+on one blind before using them in automations.
 
 Higher tilt is assumed to be *open* (an opening pulse raises the angle, verified on an F401 roller shutter with tilting slats in [discussion #770](https://github.com/orgs/OpenWebNet-HA/discussions/770#discussioncomment-19144521) with `slat_time: 1.4`). Dedicated Venetian actuators (such as the F411U2 in Venetian mode) still await a keypad / app capture (#492).
 
@@ -219,7 +294,7 @@ When an actuator or external controller broadcasts a Dimension 11 event (such as
 ### Travel Time Calibration & Slat Rotation
 
 End-to-end travel time (`travel_time_down` / `travel_time_up`) includes one full slat rotation (`slat_time`) at the start of the run:
-* On a slat blind, linear curtain travel is estimated over `travel_time_down - slat_time` and `travel_time_up - slat_time` after the slats finish rotating.
+* On a slat blind, linear curtain travel is estimated over `travel_time_down - slat_time_down` and `travel_time_up - slat_time_up` after the slats finish rotating. Each effective directional slat time inherits `slat_time` when not overridden.
 * Mid-tilt stops do not corrupt or reset linear curtain position estimation.
 * Tilt commands are safely rejected if the cover is actively running automated travel-time calibration.
 

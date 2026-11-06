@@ -5,7 +5,9 @@ import asyncio
 import inspect
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import timedelta
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
@@ -76,8 +78,14 @@ from .const import (
     CONF_MIN_POSITION_DELTA,
     CONF_PIN_CODE,
     CONF_PULSE_DURATION,
+    CONF_SLAT_GRANULARITY,
+    CONF_SLAT_OFFSET,
+    CONF_SLAT_OFFSET_DOWN,
+    CONF_SLAT_OFFSET_UP,
     CONF_SLAT_TILT,
     CONF_SLAT_TIME,
+    CONF_SLAT_TIME_DOWN,
+    CONF_SLAT_TIME_UP,
     CONF_STATE_SENSOR,
     CONF_STRATEGY,
     CONF_TRAVEL_TIME,
@@ -85,6 +93,8 @@ from .const import (
     DEFAULT_MIN_CYCLE_TIME,
     DEFAULT_MIN_MOTOR_PULSE,
     DEFAULT_PULSE_DURATION,
+    DEFAULT_SLAT_GRANULARITY,
+    DEFAULT_SLAT_OFFSET,
     DEFAULT_SLAT_TIME,
     DEFAULT_TRAVEL_TIME,
     DOMAIN,
@@ -128,6 +138,14 @@ from .cover_motion import (
 from .cover_motion import (
     MIN_POSITION_DELTA as MIN_POSITION_DELTA,
 )
+from .cover_slat import (
+    SLAT_SETTINGS,
+    SlatPlan,
+    plan_tilt_compensation,
+    slat_height_change,
+    snap_tilt_target,
+    validate_slat_setting,
+)
 from .cover_strategies import (
     CoverKinematicsStrategy,
     NativePositionStrategy,
@@ -145,6 +163,7 @@ from .discovery import (
 )
 from .gateway import MyHOMEGatewayHandler
 from .myhome_device import MyHOMEEntity
+from .validate import validate_min_position_delta
 
 if TYPE_CHECKING:
     from .cover_scope import CoverFamily, CoverScope, MyHOMEScopeCover
@@ -157,6 +176,15 @@ OFF_RETRY_DELAY = 1.0
 OFF_SETTLE_DELAY = 0.2
 
 _clamp_slat_time = clamp_slat_time
+
+
+def _service_slat_setting(name: str, value: object) -> float | int:
+    """Apply the shared slat contract at the entity service boundary."""
+    try:
+        return validate_slat_setting(name, value)
+    except (ValueError, TypeError) as err:
+        raise vol.Invalid(str(err)) from err
+
 
 # Known standard timed relay actuators that do not implement OpenWebNet Dimension 10 position reporting
 # (Encyclopedia OWN-DEV-0022/0023/0098/0141/0153: F411 family and flush-mounted 4671/2 / AM5851/2 relays).
@@ -234,10 +262,12 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
             # start from the configured travel time.
             kwargs["travel_time_source"] = "yaml" if CONF_TRAVEL_TIME in cfg else "default"
             kwargs["calibration"] = _stored_calibration(config_entry, ctx.key)
-        elif (stored := _stored_calibration(config_entry, ctx.key)) and stored.get(CONF_SLAT_TIME) is not None:
-            # yaml covers keep their configured travel time, but a slat time set
-            # with myhome.set_cover_travel_time wins until it is reset.
-            kwargs["calibration"] = {CONF_SLAT_TIME: stored[CONF_SLAT_TIME]}
+        elif stored := _stored_calibration(config_entry, ctx.key):
+            # YAML travel times stay configured; stored slat and native minimum overrides win.
+            kwargs["calibration"] = {
+                key: stored[key] for key in (*SLAT_SETTINGS, CONF_MIN_POSITION_DELTA)
+                if stored.get(key) is not None
+            }
         # cover_schema folds a yaml `device_class:` into CONF_DEVICE_CLASS; the raw
         # key is kept as a fallback for callers that bypass the schema, as build_impulse does.
         raw_dev_class = cfg.get(CONF_DEVICE_CLASS) or cfg.get("device_class")
@@ -261,6 +291,12 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
             advanced=cfg.get(CONF_ADVANCED_SHUTTER, cfg.get("advanced_shutter", False)),
             slat_tilt=bool(cfg.get(CONF_SLAT_TILT, False)),
             slat_time=_clamp_slat_time(cfg.get(CONF_SLAT_TIME)),
+            slat_time_up=cfg.get(CONF_SLAT_TIME_UP),
+            slat_time_down=cfg.get(CONF_SLAT_TIME_DOWN),
+            slat_offset=cfg.get(CONF_SLAT_OFFSET, DEFAULT_SLAT_OFFSET),
+            slat_offset_up=cfg.get(CONF_SLAT_OFFSET_UP),
+            slat_offset_down=cfg.get(CONF_SLAT_OFFSET_DOWN),
+            slat_granularity=cfg.get(CONF_SLAT_GRANULARITY, DEFAULT_SLAT_GRANULARITY),
             strategy_name=cfg.get(CONF_STRATEGY),
             manufacturer=cfg.get(CONF_MANUFACTURER) or "BTicino",
             model=cfg.get(CONF_DEVICE_MODEL) or "Shutter / Cover",
@@ -336,9 +372,11 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         vol.Optional("travel_time_down"): vol.Coerce(float),
         vol.Optional("travel_time_up"): vol.Coerce(float),
         vol.Optional("min_motor_pulse"): vol.Coerce(float),
-        vol.Optional(CONF_SLAT_TIME): vol.All(vol.Coerce(float), vol.Range(min=MIN_SLAT_TIME, max=MAX_SLAT_TIME)),
+        vol.Optional(CONF_MIN_POSITION_DELTA): validate_min_position_delta,
         vol.Optional("copied_from"): cv.string,
     }
+    for setting in SLAT_SETTINGS:
+        SCHEMA_SET_COVER_TRAVEL_TIME[vol.Optional(setting)] = partial(_service_slat_setting, setting)
 
     platform = entity_platform.current_platform.get()
     if platform is not None:
@@ -401,6 +439,12 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         min_position_delta: int = MIN_POSITION_DELTA,
         slat_tilt: bool = False,
         slat_time: float = DEFAULT_SLAT_TIME,
+        slat_time_up: float | None = None,
+        slat_time_down: float | None = None,
+        slat_offset: float = DEFAULT_SLAT_OFFSET,
+        slat_offset_up: float | None = None,
+        slat_offset_down: float | None = None,
+        slat_granularity: int = DEFAULT_SLAT_GRANULARITY,
         strategy_name: str | None = None,
         device_class: CoverDeviceClass | None = None,
     ):
@@ -429,6 +473,12 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         self._advanced = advanced
         self._slat_tilt = bool(slat_tilt)
         raw_slat_time = _clamp_slat_time(slat_time)
+        raw_slat_time_up = slat_time_up
+        raw_slat_time_down = slat_time_down
+        self._slat_offset = float(slat_offset)
+        self._slat_offset_up = slat_offset_up
+        self._slat_offset_down = slat_offset_down
+        self._slat_granularity = int(slat_granularity)
         self._is_tilting: bool = False
         self._tilt_start_time: float | None = None
         # None: the running pulse started from an unknown angle, known again at a slat stop.
@@ -440,6 +490,12 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         # Tilt requests run one at a time; a newer target replaces one still waiting.
         self._tilt_lock = asyncio.Lock()
         self._tilt_request_seq = 0
+        self._compensation_cancel: asyncio.Event | None = None
+        self._compensation_plan: SlatPlan | None = None
+        self._compensation_phase: str | None = None
+        self._compensation_expected_stop = False
+        self._compensation_height_opening = False
+        self._compensation_height_stopped = asyncio.Event()
         # Delivery futures of the running pulse's direction frame and of its
         # stop while that still waits in the send queue.
         self._pulse_written: Any = None
@@ -459,6 +515,18 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         if calibration:
             if calibration.get("slat_time") is not None:
                 raw_slat_time = _clamp_slat_time(calibration["slat_time"], raw_slat_time)
+            if calibration.get(CONF_SLAT_TIME_UP) is not None:
+                raw_slat_time_up = calibration[CONF_SLAT_TIME_UP]
+            if calibration.get(CONF_SLAT_TIME_DOWN) is not None:
+                raw_slat_time_down = calibration[CONF_SLAT_TIME_DOWN]
+            if calibration.get(CONF_SLAT_OFFSET) is not None:
+                self._slat_offset = float(calibration[CONF_SLAT_OFFSET])
+            if calibration.get(CONF_SLAT_OFFSET_UP) is not None:
+                self._slat_offset_up = float(calibration[CONF_SLAT_OFFSET_UP])
+            if calibration.get(CONF_SLAT_OFFSET_DOWN) is not None:
+                self._slat_offset_down = float(calibration[CONF_SLAT_OFFSET_DOWN])
+            if calibration.get(CONF_SLAT_GRANULARITY) is not None:
+                self._slat_granularity = int(calibration[CONF_SLAT_GRANULARITY])
             if calibration.get("down") and calibration.get("up"):
                 down = float(calibration["down"])
                 up = float(calibration["up"])
@@ -468,6 +536,8 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
                 self._copied_from = calibration.get("copied_from") or None
             if calibration.get("min_motor_pulse") is not None:
                 raw_min_pulse = float(calibration["min_motor_pulse"])
+            if calibration.get(CONF_MIN_POSITION_DELTA) is not None:
+                min_position_delta = validate_min_position_delta(calibration[CONF_MIN_POSITION_DELTA])
         self._calibrating = False
         self._calibration_interrupted: str | None = None
         self._stopped_event: asyncio.Event = asyncio.Event()
@@ -489,6 +559,8 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             travel_time_down=down,
             slat_tilt=self._slat_tilt,
             slat_time=raw_slat_time,
+            slat_time_up=raw_slat_time_up,
+            slat_time_down=raw_slat_time_down,
             min_motor_pulse=raw_min_pulse,
             min_position_delta=min_position_delta,
         )
@@ -638,6 +710,15 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
     def _slat_time(self, value: float) -> None:
         self._strategy.slat_time = float(value)
 
+    def _slat_time_for(self, opening: bool) -> float:
+        """Return the configured slat time for a motor direction."""
+        return self._strategy.slat_time_for(opening)
+
+    def _slat_offset_for(self, opening: bool) -> float:
+        """Return the signed height change expected for a full slat rotation."""
+        directional = self._slat_offset_up if opening else self._slat_offset_down
+        return float(directional if directional is not None else self._slat_offset)
+
     @property
     def calibration_hub(self) -> CoverCalibrationHub:
         """Return the CoverCalibrationHub for this cover's gateway."""
@@ -782,8 +863,8 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         """Turn the slats for a curtain run that ended at ``at``."""
         if not self._slat_tilt or not (was_opening or was_closing):
             return
-        run_duration = max(0.0, at - run_started_at) if run_started_at is not None else (self._slat_time + 1.0)
         direction = "open" if was_opening else "close"
+        run_duration = max(0.0, at - run_started_at) if run_started_at is not None else (self._slat_time_for(was_opening) + 1.0)
         self._attr_current_cover_tilt_position = self._strategy.turn_slats_after(
             self._attr_current_cover_tilt_position, run_duration, direction
         )
@@ -1017,7 +1098,22 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         )
         if getattr(self, "_attr_extra_state_attributes", None) is not None:
             self._attr_extra_state_attributes["slat_tilt"] = True
-            self._attr_extra_state_attributes["slat_time"] = self._slat_time
+            self._refresh_slat_attributes()
+
+    def _refresh_slat_attributes(self) -> None:
+        """Publish effective slat timing and compensation settings."""
+        attrs = getattr(self, "_attr_extra_state_attributes", None)
+        if attrs is None or not self._slat_tilt:
+            return
+        attrs.update({
+            "slat_time": self._slat_time,
+            "slat_time_up": self._slat_time_for(True),
+            "slat_time_down": self._slat_time_for(False),
+            "slat_offset": self._slat_offset,
+            "slat_offset_up": self._slat_offset_for(True),
+            "slat_offset_down": self._slat_offset_for(False),
+            "slat_granularity": self._slat_granularity,
+        })
 
     @property
     def current_cover_tilt_position(self) -> int | None:
@@ -1117,6 +1213,7 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed from hass."""
+        self._cancel_compensation_request()
         self._run_generation += 1  # a run in flight must not act on a removed entity
         self._cancel_stop_task()
         self._pending_stop_context = None
@@ -1306,8 +1403,8 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             "min_motor_pulse": self._min_motor_pulse,
             "measured_at": self._calibrated_at,
         }
-        if (stored := self._stored_record()) and stored.get(CONF_SLAT_TIME) is not None:
-            result[CONF_SLAT_TIME] = stored[CONF_SLAT_TIME]
+        stored = self._stored_record() or {}
+        result.update({key: stored[key] for key in SLAT_SETTINGS if stored.get(key) is not None})
         self._persist_calibration(result)
         if self.hass is not None:
             self.async_write_ha_state()
@@ -1381,21 +1478,50 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         min_motor_pulse: float | None = None,
         slat_time: float | None = None,
         copied_from: str | None = None,
+        slat_time_up: float | None = None,
+        slat_time_down: float | None = None,
+        slat_offset: float | None = None,
+        slat_offset_up: float | None = None,
+        slat_offset_down: float | None = None,
+        slat_granularity: int | None = None,
+        min_position_delta: int | None = None,
     ) -> dict:  # type: ignore
-        """Set the physical travel times by hand, or copy them from another cover.
+        """Set travel times, slat settings or the native minimum height movement.
 
         ``copied_from`` records the entity the times were taken from; the source
         is then reported as ``copied`` instead of ``manual``.
         """
         has_travel = travel_time is not None or travel_time_down is not None or travel_time_up is not None
-        if slat_time is not None and not self._slat_tilt:
+        values = (slat_time, slat_time_up, slat_time_down, slat_offset,
+                  slat_offset_up, slat_offset_down, slat_granularity)
+        slat_values = {key: value for key, value in zip(SLAT_SETTINGS, values, strict=True) if value is not None}
+        if min_position_delta is not None:
+            if not self._advanced:
+                cause = "min_position_delta only applies to an advanced cover (use min_motor_pulse on a timed cover)"
+                raise ServiceValidationError(
+                    f"{self._display_name}: {cause}",
+                    translation_domain=DOMAIN, translation_key="calibration_interrupted",
+                    translation_placeholders={"name": self._display_name, "cause": cause},
+                )
+            try:
+                min_position_delta = validate_min_position_delta(min_position_delta)
+            except vol.Invalid as err:
+                raise ServiceValidationError(
+                    f"{self._display_name}: {err}",
+                    translation_domain=DOMAIN, translation_key="calibration_interrupted",
+                    translation_placeholders={"name": self._display_name, "cause": str(err)},
+                ) from err
+        if slat_values and not self._slat_tilt:
             raise ServiceValidationError(
-                f"{self._display_name} does not have slat_tilt enabled; slat_time cannot be set",
+                f"{self._display_name} does not have slat_tilt enabled; slat settings cannot be set",
                 translation_domain=DOMAIN,
                 translation_key="slat_tilt_not_enabled",
                 translation_placeholders={"name": self._display_name},
             )
-        if self._advanced and (has_travel or min_motor_pulse is not None or slat_time is None):
+        if self._advanced and (
+            has_travel or min_motor_pulse is not None
+            or (not slat_values and min_position_delta is None)
+        ):
             raise HomeAssistantError(
                 f"{self._display_name} reports its position (advanced: true in myhome.yaml); travel time cannot be set — if this is a standard timed actuator (e.g. F411) that does not support Dimension 10, remove advanced: true from myhome.yaml",
                 translation_domain=DOMAIN,
@@ -1403,13 +1529,43 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
                 translation_placeholders={"name": self._display_name},
             )
 
-        if not has_travel and min_motor_pulse is None and slat_time is None:
+        if not has_travel and min_motor_pulse is None and min_position_delta is None and not slat_values:
             raise ServiceValidationError(
-                "At least travel_time, travel_time_down/up, min_motor_pulse, or slat_time must be specified",
+                "At least travel_time, travel_time_down/up, min_motor_pulse, min_position_delta, or a slat setting must be specified",
                 translation_domain=DOMAIN,
                 translation_key="travel_time_missing",
             )
 
+        for key, value in slat_values.items():
+            try:
+                slat_values[key] = validate_slat_setting(key, value)
+            except (ValueError, TypeError) as err:
+                if key.startswith(CONF_SLAT_TIME):
+                    raise ServiceValidationError(
+                        str(err), translation_domain=DOMAIN, translation_key="travel_time_out_of_range",
+                        translation_placeholders={"field": key, "min": str(MIN_SLAT_TIME), "max": str(MAX_SLAT_TIME)},
+                    ) from err
+                raise ServiceValidationError(
+                    f"{self._display_name}: {err}",
+                    translation_domain=DOMAIN, translation_key="calibration_interrupted",
+                    translation_placeholders={"name": self._display_name, "cause": str(err)},
+                ) from err
+        # Resolve and validate both directions before changing even the motor floor.
+        down = travel_time_down if travel_time_down is not None else travel_time
+        up = travel_time_up if travel_time_up is not None else (travel_time if travel_time is not None else down)
+        if down is None:
+            down = self._travel_time_down
+        if up is None:
+            up = self._travel_time_up
+        if has_travel:
+            for field, value in (("travel_time_down", down), ("travel_time_up", up)):
+                if not CALIBRATION_MIN_RUN <= value <= CALIBRATION_MAX_RUN:
+                    raise ServiceValidationError(
+                        f"{field} must be between {CALIBRATION_MIN_RUN:.0f}s and {CALIBRATION_MAX_RUN:.0f}s",
+                        translation_domain=DOMAIN, translation_key="travel_time_out_of_range",
+                        translation_placeholders={"field": field, "min": f"{CALIBRATION_MIN_RUN:.0f}",
+                                                  "max": f"{CALIBRATION_MAX_RUN:.0f}"},
+                    )
         if min_motor_pulse is not None:
             if not CALIBRATION_MIN_MOTOR_PULSE <= min_motor_pulse <= CALIBRATION_MAX_MOTOR_PULSE:
                 raise ServiceValidationError(
@@ -1422,27 +1578,14 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
                         "max": f"{CALIBRATION_MAX_MOTOR_PULSE:.1f}",
                     },
                 )
+        if min_motor_pulse is not None:
             self._min_motor_pulse = round(float(min_motor_pulse), 2)
+        if min_position_delta is not None:
+            assert isinstance(self._strategy, NativePositionStrategy)
+            self._strategy.min_position_delta = min_position_delta
+            self._attr_extra_state_attributes[CONF_MIN_POSITION_DELTA] = min_position_delta
 
         if has_travel:
-            down = travel_time_down if travel_time_down is not None else travel_time
-            up = travel_time_up if travel_time_up is not None else (travel_time if travel_time is not None else down)
-
-            if down is None:
-                down = self._travel_time_down
-            assert down is not None and up is not None
-
-            for field, value in (("travel_time_down", down), ("travel_time_up", up)):
-                if not CALIBRATION_MIN_RUN <= value <= CALIBRATION_MAX_RUN:
-                    raise ServiceValidationError(
-                        f"{field} must be between {CALIBRATION_MIN_RUN:.0f}s and {CALIBRATION_MAX_RUN:.0f}s",
-                        translation_domain=DOMAIN,
-                        translation_key="travel_time_out_of_range",
-                        translation_placeholders={
-                            "field": field, "min": f"{CALIBRATION_MIN_RUN:.0f}", "max": f"{CALIBRATION_MAX_RUN:.0f}",
-                        },
-                    )
-
             self._promote_to_timed_strategy()
             self._travel_time_down = round(float(down), 2)
             self._travel_time_up = round(float(up), 2)
@@ -1450,18 +1593,15 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             self._recompute_active_settle()
 
         if slat_time is not None:
-            if not MIN_SLAT_TIME <= slat_time <= MAX_SLAT_TIME:
-                raise ServiceValidationError(
-                    f"slat_time must be between {MIN_SLAT_TIME:.1f}s and {MAX_SLAT_TIME:.1f}s",
-                    translation_domain=DOMAIN,
-                    translation_key="travel_time_out_of_range",
-                    translation_placeholders={
-                        "field": "slat_time", "min": f"{MIN_SLAT_TIME:.1f}", "max": f"{MAX_SLAT_TIME:.1f}",
-                    },
-                )
             self._slat_time = round(float(slat_time), 2)
-            if getattr(self, "_attr_extra_state_attributes", None) is not None:
-                self._attr_extra_state_attributes["slat_time"] = self._slat_time
+            slat_values[CONF_SLAT_TIME] = self._slat_time
+
+        for key, value in slat_values.items():
+            if key in (CONF_SLAT_TIME_UP, CONF_SLAT_TIME_DOWN):
+                setattr(self._strategy, key, float(value))
+            elif key != CONF_SLAT_TIME:
+                setattr(self, "_" + key, int(value) if key == CONF_SLAT_GRANULARITY else float(value))
+        self._refresh_slat_attributes()
 
         if has_travel:
             self._copied_from = str(copied_from) if copied_from else None
@@ -1477,19 +1617,21 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         }
         if self._slat_tilt:
             result["slat_time"] = self._slat_time
+        if isinstance(self._strategy, NativePositionStrategy):
+            result[CONF_MIN_POSITION_DELTA] = self._strategy.min_position_delta
         if self._copied_from:
             result["copied_from"] = self._copied_from
+        # Persist only explicitly set slat keys: inherited directions remain inherited.
+        partial = dict(self._stored_record() or {})
         if has_travel:
-            self._persist_calibration(result)
-        else:
-            # Slat time and/or min_motor_pulse only: keep the stored record's travel
-            # times untouched (and do not turn the current defaults into a stored calibration).
-            partial = dict(self._stored_record() or {})
-            if min_motor_pulse is not None:
-                partial["min_motor_pulse"] = self._min_motor_pulse
-            if slat_time is not None:
-                partial["slat_time"] = self._slat_time
-            self._persist_calibration(partial)
+            partial.update({key: value for key, value in result.items() if key not in SLAT_SETTINGS})
+        if min_motor_pulse is not None:
+            partial["min_motor_pulse"] = self._min_motor_pulse
+        if min_position_delta is not None:
+            partial[CONF_MIN_POSITION_DELTA] = min_position_delta
+        partial.update(slat_values)
+        result.update({key: value for key, value in (self._attr_extra_state_attributes or {}).items() if key in SLAT_SETTINGS})
+        self._persist_calibration(partial)
         self._refresh_travel_attributes()
         if self.hass is not None:
             self.async_write_ha_state()
@@ -1497,9 +1639,8 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         self._fire_calibration_event("done", **result)
         if not has_travel:
             LOGGER.info(
-                "%s Cover %s motor start-up floor set: %.2f s (travel times untouched: down %.1f s, up %.1f s, source: %s).",
-                self._gateway_handler.log_id, self._full_where, self._min_motor_pulse,
-                self._travel_time_down, self._travel_time_up, self._calibration_source,
+                "%s Cover %s calibration settings set: %s (travel times untouched).",
+                self._gateway_handler.log_id, self._full_where, result,
             )
         else:
             LOGGER.info(
@@ -1522,35 +1663,41 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
                 self._travel_recomputed.set()
 
     async def async_reset_travel_time(self) -> None:
-        """Reset travel times back to default or YAML configuration."""
-        if self._advanced and not self._slat_tilt:
-            raise HomeAssistantError(
-                f"{self._display_name} reports its position (advanced: true in myhome.yaml); calibration is not applicable — if this is a standard timed actuator (e.g. F411) that does not support Dimension 10, remove advanced: true from myhome.yaml",
-                translation_domain=DOMAIN,
-                translation_key="cover_reports_position",
-                translation_placeholders={"name": self._display_name},
-            )
+        """Reset travel times, slat settings and the native minimum to YAML/defaults."""
 
         entry = getattr(self._gateway_handler, "config_entry", None)
         hass = self.hass or self._hass
         if entry is not None and getattr(entry, "entry_id", None) and hass is not None and hasattr(hass, "config_entries"):
             options = dict(getattr(entry, "options", None) or {})
             stored = dict(options.get(CONF_COVER_TRAVEL_TIMES) or {})
-            if str(self._device_id) in stored:
-                del stored[str(self._device_id)]
+            key = str(self._device_id)
+            base, sep, rest = key.partition("#")
+            keys = [key]
+            if len(base) == 2 and base.startswith("0") and base != "00":
+                keys.append(f"00{base}{sep}{rest}")
+            if any(key in stored for key in keys):
+                for key in keys:
+                    stored.pop(key, None)
                 options[CONF_COVER_TRAVEL_TIMES] = stored
                 hass.config_entries.async_update_entry(entry, options=options)
 
         cfg = self._device_config() or {}
+        self._slat_time = _clamp_slat_time(cfg.get(CONF_SLAT_TIME))
+        self._strategy.slat_time_up = cfg.get(CONF_SLAT_TIME_UP)
+        self._strategy.slat_time_down = cfg.get(CONF_SLAT_TIME_DOWN)
+        self._slat_offset = float(cfg.get(CONF_SLAT_OFFSET, DEFAULT_SLAT_OFFSET))
+        self._slat_offset_up = cfg.get(CONF_SLAT_OFFSET_UP)
+        self._slat_offset_down = cfg.get(CONF_SLAT_OFFSET_DOWN)
+        self._slat_granularity = int(cfg.get(CONF_SLAT_GRANULARITY, DEFAULT_SLAT_GRANULARITY))
+        self._refresh_slat_attributes()
         if self._advanced:
-            # A position-reporting blind has no travel times, only the slat time
-            # myhome.set_cover_travel_time may have stored.
-            self._slat_time = _clamp_slat_time(cfg.get(CONF_SLAT_TIME))
-            self._attr_extra_state_attributes["slat_time"] = self._slat_time
+            assert isinstance(self._strategy, NativePositionStrategy)
+            self._strategy.min_position_delta = int(cfg.get(CONF_MIN_POSITION_DELTA, MIN_POSITION_DELTA))
+            self._attr_extra_state_attributes[CONF_MIN_POSITION_DELTA] = self._strategy.min_position_delta
             if self.hass is not None:
                 self.async_write_ha_state()
             LOGGER.info(
-                "%s Cover %s slat time reset to %.1f s.", self._gateway_handler.log_id, self._full_where, self._slat_time
+                "%s Cover %s native calibration settings reset.", self._gateway_handler.log_id, self._full_where
             )
             return
         if CONF_TRAVEL_TIME in cfg:
@@ -1572,9 +1719,6 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         self._calibrated_at = None
         self._copied_from = None
         # The stored record (and any slat time set with the service) is gone too.
-        self._slat_time = _clamp_slat_time(cfg.get(CONF_SLAT_TIME))
-        if self._slat_tilt:
-            self._attr_extra_state_attributes["slat_time"] = self._slat_time
 
         self._refresh_travel_attributes()
         if self.hass is not None:
@@ -1627,6 +1771,7 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
 
     async def async_open_cover(self, **kwargs: Any) -> None:  # pylint: disable=unused-argument
         """Open the cover."""
+        self._cancel_compensation_request()
         if self._settles_full_run(True):
             await self._async_run_to_end(True)
             return
@@ -1634,6 +1779,7 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
 
     async def async_close_cover(self, **kwargs: Any) -> None:  # pylint: disable=unused-argument
         """Close cover."""
+        self._cancel_compensation_request()
         if self._settles_full_run(False):
             await self._async_run_to_end(False)
             return
@@ -1697,11 +1843,16 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
     async def _async_move(self, direction: str, is_tilting: bool = False) -> asyncio.Future[Any] | None:
         """Queue a direction command and return its delivery future."""
         self._begin_run(direction, is_tilting)
+        generation = self._run_generation
         if direction == "open":
             command = OWNAutomationCommand.raise_shutter(self._full_where)
         else:
             command = OWNAutomationCommand.lower_shutter(self._full_where)
         written = await self._gateway_handler.send(command)
+        if is_tilting and generation != self._run_generation:
+            if isinstance(written, asyncio.Future) and not written.done():
+                written.cancel()
+            return None
         if self._calibrating or self.calibration_hub.is_calibrating:
             _record_calibration_frame(self._gateway_handler, "tx", str(command), direction_action=direction, entity_id=self.entity_id)
         if is_tilting or not self._advanced:
@@ -1883,8 +2034,323 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             translation_placeholders={"name": self._display_name},
         )
 
+    def _cancel_compensation_request(self) -> None:
+        """Invalidate a pending compensation before another command takes ownership."""
+        self._tilt_request_seq += 1
+        if self._compensation_cancel is not None and not self._compensation_cancel.is_set():
+            self._compensation_cancel.set()
+            result = self._attr_extra_state_attributes.get("slat_compensation")
+            if isinstance(result, dict):
+                result.update({
+                    "status": "interrupted",
+                    "current_position": self.current_cover_position,
+                    "current_tilt_position": self.current_cover_tilt_position,
+                })
+            written = self._pulse_written
+            # Motor feedback can precede delivery confirmation; a running pulse still needs its STOP.
+            if (
+                self._compensation_phase == "tilt" and self._is_tilting
+                and not self._motor_started.is_set()
+                and ((isinstance(written, asyncio.Future) and not written.done())
+                     or (written is None and self._stop_task is None))
+            ):
+                self._run_generation += 1
+                if isinstance(written, asyncio.Future):
+                    written.cancel()
+                self._cancel_stop_task()
+                self._abort_tilt()
+
+    async def _wait_compensation_event(
+        self, event: asyncio.Event | asyncio.Future[float], cancel: asyncio.Event, timeout: float,
+    ) -> bool:
+        """Wait for delivery or confirmation; withdraw an unwritten frame on interruption.
+
+        :returns: Whether confirmation arrived before the request was replaced
+        """
+        ready = event if isinstance(event, asyncio.Future) else asyncio.create_task(event.wait())
+        cancelled = asyncio.create_task(cancel.wait())
+        try:
+            done, _ = await asyncio.wait({ready, cancelled}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            if cancel.is_set():
+                return False
+            if not done:
+                if isinstance(event, asyncio.Future):
+                    raise HomeAssistantError(
+                        f"{self._display_name}: direction command was not delivered to the bus "
+                        f"within {timeout:.0f} s",
+                        translation_domain=DOMAIN,
+                        translation_key="command_delivery_timeout",
+                        translation_placeholders={"name": self._display_name, "timeout": f"{timeout:.0f}"},
+                    )
+                raise CalibrationInterrupted(
+                    self._display_name, f"no stop status from the actuator within {timeout:.0f} s",
+                )
+            if ready.cancelled():
+                raise HomeAssistantError(
+                    f"{self._display_name}: direction command delivery was cancelled before reaching the bus",
+                    translation_domain=DOMAIN,
+                    translation_key="command_delivery_cancelled",
+                    translation_placeholders={"name": self._display_name},
+                )
+            try:
+                ready.result()
+            except Exception as err:
+                if isinstance(event, asyncio.Future):
+                    raise HomeAssistantError(
+                        f"{self._display_name}: direction command delivery failed: {err}",
+                        translation_domain=DOMAIN,
+                        translation_key="command_delivery_failed",
+                        translation_placeholders={"name": self._display_name, "error": str(err)},
+                    ) from err
+                raise
+            return True
+        finally:
+            for task in (ready, cancelled):
+                task.cancel()
+            await asyncio.gather(ready, cancelled, return_exceptions=True)
+
+    async def _async_set_compensated_tilt(self, target_tilt: int) -> None:
+        """Hold reported height during a tilt using at most one native height run.
+
+        :param target_tilt: Requested slat angle after target rounding
+        :raises HomeAssistantError: On missing feedback or infeasibility
+        """
+        current = self.current_cover_position
+        if not self._dim10_seen or current is None:
+            raise ServiceValidationError(
+                f"{self._display_name}: the position is unknown until the cover has run "
+                "fully open or closed once",
+                translation_domain=DOMAIN,
+                translation_key="cover_position_unknown",
+                translation_placeholders={"name": self._display_name},
+            )
+        old_plan = self._compensation_plan
+        if (
+            self._is_tilting and old_plan is not None and self._compensation_phase == "tilt"
+            and self._compensation_cancel is not None and not self._compensation_cancel.is_set()
+            and self._motor_started.is_set() and self._tilt_follows is None
+            and self._pulse_written is not None and self._pulse_stop_written is None
+        ):
+            current_tilt = self._interpolated_tilt(time.monotonic())
+            if current_tilt is not None:
+                active_result = self._attr_extra_state_attributes["slat_compensation"]
+                offset_up = float(active_result["slat_offset_up"])
+                offset_down = float(active_result["slat_offset_down"])
+                reversing = target_tilt != current_tilt and (
+                    (target_tilt > current_tilt) != (self._tilt_direction == "open")
+                )
+                held = old_plan.expected_position - old_plan.position_error
+                change = slat_height_change(old_plan.start_tilt, target_tilt, offset_up, offset_down)
+                expected = max(0.0, min(100.0, old_plan.pre_position + change))
+                if (not reversing or offset_up == offset_down) and abs(expected - held) <= 0.5:
+                    self._tilt_request_seq += 1
+                    request = self._tilt_request_seq
+                    async with self._tilt_lock:
+                        await self._async_wait_pulse_stop_written()
+                        if request != self._tilt_request_seq:
+                            return
+                        if self._is_tilting and self._compensation_plan is old_plan:
+                            self._compensation_plan = replace(
+                                old_plan, expected_position=expected, position_error=expected - held,
+                            )
+                            active_result.update({
+                                "tilt_position": target_tilt, "height_change": change,
+                                "expected_position": expected, "expected_position_error": expected - held,
+                            })
+                            await self._async_start_tilt(target_tilt)
+                            active_result["tilt_start_position"] = self._tilt_initial_position
+                            return
+        if self._is_tilting or self._attr_is_opening or self._attr_is_closing:
+            raise ServiceValidationError(
+                f"{self._display_name} is moving; stop it before tilting the slats",
+                translation_domain=DOMAIN, translation_key="cover_busy_moving",
+                translation_placeholders={"name": self._display_name},
+            )
+        position = current
+        assert isinstance(self._strategy, NativePositionStrategy)
+        try:
+            plan = plan_tilt_compensation(
+                current, self.current_cover_tilt_position, target_tilt,
+                offset_up=self._slat_offset_for(True), offset_down=self._slat_offset_for(False),
+                time_up=self._slat_time_for(True), time_down=self._slat_time_for(False),
+                min_delta=self._strategy.min_position_delta, min_pulse=self._min_motor_pulse,
+            )
+        except ValueError as err:
+            raise ServiceValidationError(
+                f"{self._display_name}: {err}",
+                translation_domain=DOMAIN,
+                translation_key="calibration_interrupted",
+                translation_placeholders={"name": self._display_name, "cause": str(err)},
+            ) from err
+        self._cancel_compensation_request()
+        cancel = asyncio.Event()
+        self._compensation_cancel = cancel
+        self._compensation_plan = plan
+        self._compensation_height_opening = plan.pre_position > current
+        self._compensation_phase = "height"
+        self._compensation_height_stopped.clear()
+        result: dict[str, object] = {
+            "position": position, "tilt_position": target_tilt,
+            "pre_position": plan.pre_position, "expected_position": plan.expected_position,
+            "limited": plan.limited, "expected_position_error": plan.position_error,
+            "slat_time_up": self._slat_time_for(True), "slat_time_down": self._slat_time_for(False),
+            "slat_offset_up": self._slat_offset_for(True), "slat_offset_down": self._slat_offset_for(False),
+        }
+        self._attr_extra_state_attributes["slat_compensation"] = result
+        try:
+            if plan.move:
+                # Do not pass through normal native target widening: the planner already enforces the floor.
+                self._cancel_stop_task()
+                if plan.pre_position in (0, 100):
+                    self._begin_command("open" if plan.pre_position == 100 else "close")
+                written = await self._async_set_native_position(plan.pre_position)
+                if isinstance(written, asyncio.Future):
+                    if not await self._wait_compensation_event(written, cancel, WRITE_TIMEOUT):
+                        return
+                    if self._pending_cmd is not None:
+                        self._echo_until = written.result() + ECHO_WINDOW
+                if not await self._wait_compensation_event(
+                    self._compensation_height_stopped, cancel, CALIBRATION_RUN_TIMEOUT,
+                ):
+                    return
+            if cancel.is_set():
+                return
+            # Re-read after the authoritative stopped report; a short height run may not fully turn the slats.
+            start_tilt = self.current_cover_tilt_position
+            if start_tilt is None:
+                raise ServiceValidationError(
+                    f"{self._display_name}: the slat angle is unknown until the slats have "
+                    "been tilted fully open or closed once",
+                    translation_domain=DOMAIN,
+                    translation_key="cover_tilt_position_unknown",
+                    translation_placeholders={"name": self._display_name},
+                )
+            if start_tilt != target_tilt and self._strategy.tilt_pulse_duration_for(start_tilt, target_tilt) <= 0:
+                cause = "Remaining tilt pulse is below min_motor_pulse; no tilt sent"
+                raise ServiceValidationError(
+                    f"{self._display_name}: {cause}",
+                    translation_domain=DOMAIN,
+                    translation_key="calibration_interrupted",
+                    translation_placeholders={"name": self._display_name, "cause": cause},
+                )
+            result["tilt_start_position"] = start_tilt
+            height_change = slat_height_change(
+                start_tilt, target_tilt, self._slat_offset_for(True), self._slat_offset_for(False),
+            )
+            expected_position = max(0.0, min(100.0, plan.pre_position + height_change))
+            self._compensation_plan = replace(
+                plan, start_tilt=start_tilt,
+                expected_position=expected_position, position_error=expected_position - position,
+            )
+            result.update({
+                "height_change": height_change, "expected_position": expected_position,
+                "expected_position_error": expected_position - position,
+            })
+            self._compensation_phase = "tilt"
+            async with self._tilt_lock:
+                await self._async_wait_pulse_stop_written()
+                if cancel.is_set():
+                    return
+                await self._async_start_tilt(target_tilt)
+            await self._async_wait_pulse_end()
+            if cancel.is_set():
+                return
+            # Poll once for post-tilt authoritative height (never synthesize a corrected HA position).
+            self._compensation_phase = "final"
+            self._compensation_height_stopped.clear()
+            await self.async_update()
+            if not await self._wait_compensation_event(
+                self._compensation_height_stopped, cancel, WRITE_TIMEOUT,
+            ):
+                return
+            final = self.current_cover_position
+            result.update({"status": "done", "current_position": final,
+                           "current_tilt_position": self.current_cover_tilt_position,
+                           "position_error": final - position if final is not None else None})
+        except (Exception, asyncio.CancelledError) as err:
+            if self._compensation_cancel is cancel and not cancel.is_set():
+                self._cancel_compensation_request()
+            result.update({"status": "interrupted", "error": str(err), "current_position": self.current_cover_position,
+                           "current_tilt_position": self.current_cover_tilt_position})
+            raise
+        finally:
+            if cancel.is_set():
+                result.update({
+                    "status": "interrupted", "current_position": self.current_cover_position,
+                    "current_tilt_position": self.current_cover_tilt_position,
+                })
+            if self._compensation_cancel is cancel:
+                self._compensation_cancel = None
+                self._compensation_plan = None
+                self._compensation_phase = None
+                self._compensation_expected_stop = False
+            self._publish_state()
+
+    def _observe_compensation_motion(self, message: OWNMessage) -> None:
+        """Invalidate on takeover; only the planned stopped height can release the tilt."""
+        if self._compensation_cancel is None or self._compensation_plan is None:
+            return
+        phase, plan = self._compensation_phase, self._compensation_plan
+        if message.dimension == 11:
+            # Use OWNd's decoded payload, not a new frame parser.
+            if message.dimension_value != [str(plan.pre_position)] or phase != "height":
+                self._cancel_compensation_request()
+            return
+        opening = bool(getattr(message, "is_opening", False))
+        closing = bool(getattr(message, "is_closing", False))
+        position = getattr(message, "current_position", None)
+        translation = getattr(message, "is_translation", False) is True
+        what = getattr(message, "effective_what", None)
+        own_start_echo = (
+            phase in ("height", "tilt") and self._pending_cmd in ("open", "close")
+            and not self._motor_started.is_set() and self._in_echo_window(time.monotonic())
+        )
+        if translation and what in (0, 10):
+            if phase == "height" and not self._compensation_height_stopped.is_set() and not own_start_echo:
+                self._cancel_compensation_request()
+            elif phase == "tilt" and not self._compensation_expected_stop and not own_start_echo:
+                self._cancel_compensation_request()
+        if translation and what in (1, 2, 11, 12, 13, 14) and not self._in_echo_window(time.monotonic()):
+            self._cancel_compensation_request()
+        if opening or closing:
+            if phase == "height" and opening != self._compensation_height_opening:
+                self._cancel_compensation_request()
+            elif phase == "height" and not translation and self._pending_cmd in ("open", "close"):
+                self._motor_started.set()
+                self._end_echo_window()
+            elif phase in ("tilt", "final") and (
+                opening != (self._tilt_target_position > (
+                    self._tilt_initial_position if self._tilt_initial_position is not None else plan.start_tilt
+                ))
+                or (phase == "final" and not self._compensation_expected_stop)
+            ):
+                self._cancel_compensation_request()
+        if phase == "height" and isinstance(position, int) and not opening and not closing:
+            if position != plan.pre_position:
+                # A stale poll of the start height before motion is harmless. A stop elsewhere is not.
+                if self._attr_is_opening or self._attr_is_closing or position != self.current_cover_position:
+                    self._cancel_compensation_request()
+        elif phase == "height" and not translation and position is None and not opening and not closing:
+            if (
+                getattr(message, "_what", None) == 0 and not self._compensation_height_stopped.is_set()
+                and not own_start_echo
+            ):
+                self._cancel_compensation_request()
+
+    async def _async_set_native_position(self, position: int) -> asyncio.Future[float] | None:
+        """Send a native height target through the existing direction/level paths."""
+        if position >= 100:
+            return await self._async_move("open")
+        if position <= 0:
+            return await self._async_move("close")
+        self._echo_until = time.monotonic() + ECHO_WINDOW
+        return await self._gateway_handler.send(
+            OWNAutomationCommand.set_shutter_level(self._full_where, position)
+        )
+
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         """Move the cover to a specific position."""
+        self._cancel_compensation_request()
         if ATTR_POSITION not in kwargs:
             return
         target_position = kwargs[ATTR_POSITION]
@@ -1921,17 +2387,13 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             # and so put the actuator's own level back in step with the curtain,
             # also when it already reports that end. The MH201 rejects the
             # level command at 0% anyway.
+            # Public endpoint dispatch also prepares and settles scope members.
             if target_position >= 100:
                 await self.async_open_cover()
             elif target_position <= 0:
                 await self.async_close_cover()
             else:
-                self._echo_until = now + ECHO_WINDOW
-                await self._gateway_handler.send(
-                    OWNAutomationCommand.set_shutter_level(
-                        self._full_where, target_position
-                    )
-                )
+                await self._async_set_native_position(target_position)
             return
 
         if self._calibrating:
@@ -2075,6 +2537,8 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         """Queue a stop command and return its delivery handle."""
         was_tilting = self._is_tilting
         at = kwargs.get("at")
+        if was_tilting and at is not None and self._compensation_phase == "tilt":
+            self._compensation_expected_stop = True
         self._begin_stop()
         generation = self._run_generation
         queued_at = time.monotonic()
@@ -2095,6 +2559,8 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
 
     async def async_stop_cover(self, **kwargs: Any) -> None:  # pylint: disable=unused-argument
         """Stop the cover."""
+        if kwargs.get("at") is None:
+            self._cancel_compensation_request()
         await self._async_stop(**kwargs)
 
     def _settle_pulse_on_write(self, written: Any, generation: int, not_before: float) -> None:
@@ -2111,7 +2577,8 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             if generation != self._run_generation or not self._is_tilting:
                 return  # a newer command, or a stop status, already ended the pulse
             stopped_at: float | None = None
-            if fut is not None and not fut.cancelled() and fut.exception() is None:
+            delivery_failed = fut is not None and (fut.cancelled() or fut.exception() is not None)
+            if fut is not None and not delivery_failed:
                 result = fut.result()
                 stopped_at = float(result) if isinstance(result, (int, float)) else None
             elif fut is not None:
@@ -2122,6 +2589,8 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             # The stop cannot leave before it was queued (nor the auto-stop before it was due).
             stopped_at = max(stopped_at if stopped_at is not None else time.monotonic(), not_before)
             self._apply_tilt_stop(stopped_at)
+            if delivery_failed and self._compensation_phase in ("tilt", "final"):
+                self._cancel_compensation_request()
             self._publish_state()
 
         if isinstance(written, asyncio.Future) and not written.done():
@@ -2139,7 +2608,7 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             return self.current_cover_tilt_position
         direction = "open" if self._tilt_step() > 0 else "close"
         elapsed = max(0.0, at - self._tilt_start_time)
-        if self._tilt_initial_position is None and elapsed < self._slat_time:
+        if self._tilt_initial_position is None and elapsed < self._slat_time_for(direction == "open"):
             # A pulse from an unknown angle: nothing to count it from until the
             # slats reach their stop (a full rotation); then the strategy
             # computes it from the far end, which is where a full rotation ends.
@@ -2252,8 +2721,10 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
 
     async def _async_wait_pulse_end(self) -> None:
         """Wait until the running slat pulse has stopped and its stop is on the bus."""
-        if (task := self._stop_task) is not None and not task.done():
-            await asyncio.wait({task}, timeout=WRITE_TIMEOUT + MAX_SLAT_TIME + ECHO_WINDOW)
+        while (task := self._stop_task) is not None and not task.done():
+            done, _ = await asyncio.wait({task}, timeout=WRITE_TIMEOUT + MAX_SLAT_TIME + ECHO_WINDOW)
+            if not done:
+                break
         await self._async_wait_pulse_stop_written()
 
     def _end_pulse_for_takeover(self) -> None:
@@ -2281,7 +2752,7 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         """Move the cover tilt to a specific position."""
         if ATTR_TILT_POSITION not in kwargs:
             return
-        target_tilt = max(0, min(100, int(round(float(kwargs[ATTR_TILT_POSITION])))))
+        target_tilt = snap_tilt_target(float(kwargs[ATTR_TILT_POSITION]), self._slat_granularity)
         if self._calibrating:
             raise HomeAssistantError(
                 f"{self.entity_id} is being calibrated; try again when it has finished",
@@ -2289,7 +2760,19 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
                 translation_key="cover_busy_calibrating",
                 translation_placeholders={"entity_id": str(self.entity_id)},
             )
-        self._tilt_request_seq += 1
+        current_tilt = self._interpolated_tilt(time.monotonic()) if self._is_tilting else self.current_cover_tilt_position
+        opening = target_tilt > current_tilt if current_tilt is not None else target_tilt == 100
+        needs_offset = (current_tilt is None or target_tilt != current_tilt) and self._slat_offset_for(opening) != 0
+        if current_tilt is None and 0 < target_tilt < 100:
+            needs_offset = self._slat_offset_for(True) != 0 or self._slat_offset_for(False) != 0
+        if (
+            self._advanced and self._slat_tilt and self.scope is None
+            and (needs_offset or (self._is_tilting and self._compensation_plan is not None))
+            and (target_tilt != self.current_cover_tilt_position or self._is_tilting)
+        ):
+            await self._async_set_compensated_tilt(target_tilt)
+            return
+        self._cancel_compensation_request()
         request = self._tilt_request_seq
         async with self._tilt_lock:
             await self._async_wait_pulse_stop_written()
@@ -2364,12 +2847,17 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
         self._tilt_direction = direction
         self._tilt_start_time = None
 
+        request = self._tilt_request_seq
         try:
             written = await self._async_move(direction, is_tilting=True)
         except Exception:
-            self._is_tilting = False
-            self._tilt_direction = None
+            if request == self._tilt_request_seq:
+                self._is_tilting = False
+                self._tilt_direction = None
             raise
+
+        if request != self._tilt_request_seq or not self._is_tilting:
+            return
 
         # _tilt_start_time stays None (no slat travel counted) until the frame is
         # written: on a busy queue the motor is still idle for a while.
@@ -2393,6 +2881,8 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
                         write_ts = None
                         failure: Exception | None = HomeAssistantError("tilt command was cancelled before reaching the bus")
                     except Exception as err:  # noqa: BLE001 - timeout or delivery failure
+                        if not written.done():
+                            written.cancel()
                         write_ts = None
                         failure = err
                     else:
@@ -2401,6 +2891,8 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
                         # The motor never started: nothing to stop, nothing moved.
                         if generation == self._run_generation:
                             self._abort_tilt()
+                            if self._compensation_phase in ("tilt", "final"):
+                                self._cancel_compensation_request()
                         LOGGER.error(
                             "%s Tilt pulse for %s was not delivered: %s", self._gateway_handler.log_id, self._full_where, failure
                         )
@@ -2441,6 +2933,10 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             except HomeAssistantError as err:
                 LOGGER.error("%s Auto-stop tilt aborted for %s: %s", self._gateway_handler.log_id, self._full_where, err)
                 self._apply_tilt_stop()
+                if (
+                    generation == self._run_generation and self._compensation_phase in ("tilt", "final")
+                ):
+                    self._cancel_compensation_request()
             except asyncio.CancelledError:
                 pass
 
@@ -2569,6 +3065,7 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
     @callback
     def handle_event(self, message: OWNMessage) -> None:
         """Handle an event message."""
+        self._observe_compensation_motion(message)
         is_translation = getattr(message, "is_translation", None) is True
         if is_translation:
             effective_what = getattr(message, "effective_what", None)
@@ -2659,8 +3156,28 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             return
         if position is not None:
             previous_position = self._attr_current_cover_position
+            if (
+                self._compensation_phase == "height" and self._pending_cmd in ("open", "close")
+                and not self._motor_started.is_set() and self._in_echo_window(now)
+                and position == previous_position
+            ):
+                # The endpoint command's pre-start idle report is not its final stop.
+                self._publish_state()
+                return
+            own_slat_height = False
+            if (
+                self._compensation_phase in ("tilt", "final") and self._compensation_cancel is not None
+                and not self._compensation_cancel.is_set() and self._compensation_plan is not None
+            ):
+                plan = self._compensation_plan
+                own_slat_height = (
+                    min(plan.pre_position, plan.expected_position) - 1
+                    <= position <= max(plan.pre_position, plan.expected_position) + 1
+                )
+                if not own_slat_height:
+                    self._cancel_compensation_request()
             if self._is_tilting:
-                if position != previous_position and previous_position is not None:
+                if position != previous_position and previous_position is not None and not own_slat_height:
                     # External movement took over the motor during a slat pulse (#868).
                     self._end_pulse_for_takeover()
                 else:
@@ -2686,7 +3203,7 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             self._move_start_time = None
             self._attr_is_opening = False
             self._attr_is_closing = False
-            if self._slat_tilt and not self._is_tilting:
+            if self._slat_tilt and not self._is_tilting and not own_slat_height:
                 if was_opening or was_closing:
                     self._turn_slats_for_run(now, self._run_started_at, was_opening, was_closing)
                 elif position != previous_position and previous_position is not None:
@@ -2901,6 +3418,15 @@ class MyHOMECover(MyHOMEEntity, CoverEntity):
             self._attr_current_cover_position = None
             if not (self._attr_is_opening or self._attr_is_closing):
                 self._attr_is_closed = None
+
+        if (
+            self._compensation_cancel is not None and not self._compensation_cancel.is_set()
+            and self._compensation_plan is not None and position is not None
+            and not self._attr_is_opening and not self._attr_is_closing
+            and (self._compensation_phase == "final" or
+                 (self._compensation_phase == "height" and position == self._compensation_plan.pre_position))
+        ):
+            self._compensation_height_stopped.set()
 
         self._publish_state()
 

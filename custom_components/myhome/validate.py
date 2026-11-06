@@ -114,8 +114,14 @@ from .const import (
     CONF_RGB,
     CONF_SAFETY_CHECK_DAYS,
     CONF_SAFETY_DEVICES_VERIFIED,
+    CONF_SLAT_GRANULARITY,
+    CONF_SLAT_OFFSET,
+    CONF_SLAT_OFFSET_DOWN,
+    CONF_SLAT_OFFSET_UP,
     CONF_SLAT_TILT,
     CONF_SLAT_TIME,
+    CONF_SLAT_TIME_DOWN,
+    CONF_SLAT_TIME_UP,
     CONF_STANDALONE,
     CONF_STATE_SENSOR,
     CONF_STEP_DOWN_ACTION,
@@ -134,13 +140,13 @@ from .const import (
     CONF_ZONE,
     COVER_STRATEGIES,
     DEFAULT_MIN_MOTOR_PULSE,
+    DEFAULT_SLAT_GRANULARITY,
     DEFAULT_SLAT_TIME,
     LOGGER,
     MAX_MIN_POSITION_DELTA,
-    MAX_SLAT_TIME,
-    MIN_SLAT_TIME,
     TYPE_IMPULSE_RELAY,
 )
+from .cover_slat import validate_slat_setting
 from .where_grammar import (
     canonical_point_spelling,
     parse_thermo_actuator_where,
@@ -580,6 +586,33 @@ access_schema = All(
 )
 
 
+def _slat_setting(name: str, value: object) -> float | int:
+    """Validate slat calibration using the same contract as the live service."""
+    try:
+        return validate_slat_setting(name, value)
+    except (ValueError, TypeError) as err:
+        raise Invalid(str(err)) from err
+
+
+def validate_min_position_delta(value: object) -> int:
+    """Validate the native cover's minimum without truncating fractional values.
+
+    :param value: Requested minimum height movement in percentage points
+    :returns: Whole-percentage minimum between 1 and 5
+    :raises Invalid: If the minimum is not a bounded whole percentage
+    """
+    message = f"min_position_delta must be a whole percentage between 1 and {MAX_MIN_POSITION_DELTA}"
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise Invalid(message)
+    try:
+        number = float(value)
+    except (ValueError, OverflowError) as err:
+        raise Invalid(message) from err
+    if not 1 <= number <= MAX_MIN_POSITION_DELTA or not number.is_integer():
+        raise Invalid(message)
+    return int(number)
+
+
 cover_schema = MyHomeDeviceSchema(
     {
         Required(str): {
@@ -628,9 +661,13 @@ cover_schema = MyHomeDeviceSchema(
             Optional("advanced_shutter", default=False): Boolean(),
             Optional(CONF_STRATEGY): In(list(COVER_STRATEGIES)),
             Optional(CONF_SLAT_TILT, default=False): Boolean(),
-            Optional(CONF_SLAT_TIME): All(
-                Coerce(float), Range(min=MIN_SLAT_TIME, max=MAX_SLAT_TIME)
-            ),
+            Optional(CONF_SLAT_TIME): lambda value: _slat_setting(CONF_SLAT_TIME, value),
+            Optional(CONF_SLAT_TIME_UP): lambda value: _slat_setting(CONF_SLAT_TIME_UP, value),
+            Optional(CONF_SLAT_TIME_DOWN): lambda value: _slat_setting(CONF_SLAT_TIME_DOWN, value),
+            Optional(CONF_SLAT_OFFSET): lambda value: _slat_setting(CONF_SLAT_OFFSET, value),
+            Optional(CONF_SLAT_OFFSET_UP): lambda value: _slat_setting(CONF_SLAT_OFFSET_UP, value),
+            Optional(CONF_SLAT_OFFSET_DOWN): lambda value: _slat_setting(CONF_SLAT_OFFSET_DOWN, value),
+            Optional(CONF_SLAT_GRANULARITY): lambda value: _slat_setting(CONF_SLAT_GRANULARITY, value),
             Optional(CONF_TRAVEL_TIME, default=25): All(
                 Coerce(int),
                 Any(0, Range(min=int(CALIBRATION_MIN_RUN), max=int(CALIBRATION_MAX_RUN))),
@@ -638,7 +675,7 @@ cover_schema = MyHomeDeviceSchema(
             Optional(CONF_MIN_MOTOR_PULSE, default=DEFAULT_MIN_MOTOR_PULSE): All(
                 Coerce(float), Range(min=CALIBRATION_MIN_MOTOR_PULSE, max=CALIBRATION_MAX_MOTOR_PULSE)
             ),
-            Optional(CONF_MIN_POSITION_DELTA): All(Coerce(int), Range(min=1, max=MAX_MIN_POSITION_DELTA)),
+            Optional(CONF_MIN_POSITION_DELTA): validate_min_position_delta,
             Optional(CONF_MANUFACTURER, default="BTicino S.p.A."): str,
             Optional(CONF_DEVICE_MODEL): Coerce(str),
             Optional(CONF_MEMBERS): [All(Coerce(str), PointToPoint())],
@@ -673,9 +710,15 @@ def _validate_cover_members(data: dict[str, typing.Any]) -> dict[str, typing.Any
             raise Invalid("slat_tilt requires a positive travel_time or advanced_shutter")
         if CONF_SLAT_TIME in cfg and not cfg.get(CONF_SLAT_TILT):
             raise Invalid("slat_time can only be defined on a cover with slat_tilt enabled")
+        slat_settings = (CONF_SLAT_TIME_UP, CONF_SLAT_TIME_DOWN, CONF_SLAT_OFFSET,
+                         CONF_SLAT_OFFSET_UP, CONF_SLAT_OFFSET_DOWN, CONF_SLAT_GRANULARITY)
+        if any(key in cfg for key in slat_settings) and not cfg.get(CONF_SLAT_TILT):
+            raise Invalid("slat settings can only be defined on a cover with slat_tilt enabled")
         if CONF_MIN_POSITION_DELTA in cfg and not cfg.get(CONF_ADVANCED_SHUTTER) and not advanced:
             raise Invalid("min_position_delta only applies to an advanced cover (use min_motor_pulse on a timed cover)")
         cfg.setdefault(CONF_SLAT_TIME, DEFAULT_SLAT_TIME)
+        if cfg.get(CONF_SLAT_TILT):
+            cfg.setdefault(CONF_SLAT_GRANULARITY, DEFAULT_SLAT_GRANULARITY)
     return data
 
 
